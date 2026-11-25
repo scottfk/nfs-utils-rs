@@ -1,0 +1,148 @@
+# nfs-utils-rs
+
+A drop-in port/reimplementation of the NFS client's helper daemons from nfs-utils, in
+Rust: `rpc.statd` and `sm-notify` (NSM, the lock-recovery side of NFSv3), and
+`rpc.idmapd`, `nfsidmap` and `libnfsidmap` (NFSv4 id mapping). Currently just something
+fun for me to tinker with in Claude, and the follow-on to
+[rpcbind-rs](https://github.com/scottfk/rpcbind-rs).
+
+## Goals
+
+- **Drop-in compatible with nfs-utils 2.8.5** (Gentoo's `net-fs/nfs-utils`), for the
+  programs it covers: the same options, `/etc/nfs.conf` and `/etc/idmapd.conf` handling,
+  messages, syslog lines and exit statuses; the same files under `/var/lib/nfs` (`state`,
+  `sm/`, `sm.bak/`, with their owners, modes and contents); the same RPC registrations;
+  byte-for-byte the same replies to every NSM request, malformed ones included, and the
+  same `SM_NOTIFY` calls to peers and to the kernel's lockd; the same id-mapping answers.
+  Upstream quirks are reproduced on purpose and listed in QUIRKS.md. Improvements come
+  later, as deliberate changes.
+- **No libtirpc.** `rpc.statd` is a root-started daemon that parses untrusted network
+  input. Its XDR, RPC messages, transports and `/etc/netconfig` come from the `tirpc` crate
+  of rpcbind-rs, which reimplements the parts of libtirpc 1.3.7 that show on the wire or
+  in messages, and gets more of it here (server registration, the select-based loop).
+- **Linux only.**
+- **Small and boring:** `libc` as the only outside crate dependency, no async, and
+  `unsafe` confined to `sys` modules.
+
+The rest of nfs-utils (`mount.nfs`, `rpc.mountd`, `rpc.nfsd`, `exportfs`, `nfsdcld`, the
+GSS daemons, ...) is out of scope and stays C.
+
+## Status
+
+Planning. This branch has the plan, the project docs and the reference build; no Rust
+code yet. Next: phase 1 (groundwork and `sm-notify`).
+
+The plan and its status live in the [roadmap](#roadmap) below, which is updated as each
+step lands.
+
+The reference is the `nfs-utils-2.8.5` release tarball, built as Gentoo's
+`net-fs/nfs-utils-2.8.5-r1` builds it ([tools/build-reference.sh](tools/build-reference.sh)),
+against the system libtirpc 1.3.7, libevent 2.1 and keyutils:
+
+- USE="-caps -junction -kerberos -ldap +libmount -nfsdctl +nfsv3 +nfsv4 -sasl -selinux
+  -tcpd +uuid": no capabilities, no TCP wrappers, no LDAP or GUMS id mapping, no GSS;
+- state directory `/var/lib/nfs`, id-mapping plugins in `/usr/lib64/libnfsidmap`;
+- `/sbin/rpc.statd`, `/sbin/sm-notify`, `/usr/sbin/rpc.idmapd`, `/usr/sbin/nfsidmap`,
+  `libnfsidmap.so.1` and its `nsswitch`, `static` and `regex` plugins.
+
+The reference build imports exactly the same libc, libtirpc, libevent and keyutils
+symbols as the installed programs and plugins, and `libnfsidmap.so` exports the same
+symbols as the installed one.
+
+How hydra uses these today: `rpcbind`, `nfsclient` and `autofs` are in the default
+runlevel; `nfsclient` runs `sm-notify` and needs `rpc.statd` (started with
+`--no-notify`, running as `nobody`, the owner of `/var/lib/nfs/sm`) and `rpc.idmapd`;
+the kernel calls `nfsidmap` through request-key for NFSv4 id lookups.
+
+## Planned layout
+
+Upstream's code for these programs is about 9,000 lines of C, plus the parts of
+`support/` they use. The port follows the files:
+
+| Path | What |
+|---|---|
+| `crates/support/` | the shared parts of nfs-utils' `support/`: `xlog.c`, `conffile.c` (`nfs.conf`, includes and `nfs.conf.d`), `support/nsm/file.c` (the state file, monitor records, privilege drop) and `support/nsm/rpc.c` (NSM calls built by hand), and the bits of `support/misc` and `support/nfs` they need |
+| `crates/statd/` | `utils/statd`: `rpc.statd` (`statd.c`, `monitor.c`, `notlist.c`, `rmtcall.c`, `callback.c`, `hostname.c`, `simu*.c`, `svc_run.c`) and `sm-notify` (`sm-notify.c`) |
+| `crates/nfsidmap/` | `support/nfsidmap`: the library and its `nsswitch`, `static` and `regex` methods |
+| `crates/idmapd/` | `utils/idmapd/idmapd.c` and `utils/nfsidmap/nfsidmap.c` |
+| `tests/` | differential tests and the harness (adapted from rpcbind-rs) |
+| `contrib/gentoo/` | packaging |
+| `tools/` | the reference build, and the checks run on the test VM |
+
+The `tirpc` crate comes from rpcbind-rs as a git dependency pinned to a commit. What
+`rpc.statd` needs that rpcbind didn't (`svc_create()`-style registration with rpcbind,
+`pmap_unset()`, `svc_getreqset()`, `rpc_control()`) goes into rpcbind-rs first, as its own
+PR, so rpcbind's differential suite keeps checking it.
+
+## Testing
+
+As in rpcbind-rs: each case runs the C program and then the port in a private user,
+mount, network and pid namespace (ids mapped from your subordinate ranges, its own
+loopback, `/run`, `/var/lib/nfs` and `/etc`, `/dev/log` captured), with rpcbind-rs's
+rpcbind running inside for registrations, and compares:
+
+- every reply byte for byte, and every call the program makes, which a fake lockd and
+  fake peers in the probe record (`SM_NOTIFY` to monitored hosts, the callbacks to
+  lockd, and their retries on a fake clock);
+- stdout, stderr, the exit status and every syslog line;
+- the registrations left in rpcbind, the sockets bound, and the files under
+  `/var/lib/nfs` and `/run` (names, modes, owners, contents);
+- for id mapping, the answers through a fake `rpc_pipefs` tree and the request-key
+  interface, with users and groups from the sandbox's own `/etc/passwd` and `/etc/group`.
+
+## Roadmap
+
+1. **Groundwork and sm-notify (planned):** the workspace and the `tirpc` dependency;
+   `crates/support` (`xlog`, `nfs.conf` parsing, `support/nsm`); the test harness; and
+   `sm-notify`: options and `[sm-notify]` settings, the state number bump, the lock and
+   the `-f` check, privilege drop, the `sm` to `sm.bak` move, and the `SM_NOTIFY` calls
+   (address lookup, `PMAPPROC_GETPORT` and retries with backoff, `-m`, `-n`, `-p`,
+   `-v`, `-P`, `-d`), against fake peers.
+2. **rpc.statd (planned):** startup (options, `[statd]` settings, `-p`/`-o` ports,
+   `-n`, `-P`, `-H` ha-callout, `-T`/`-U` lockd ports, `-N`, `-F`/`-d`, the pid file,
+   the privilege drop to the `sm/` owner, unregistering stale entries, running
+   `sm-notify` unless `--no-notify`), and the protocol: `SM_STAT`, `SM_MON`,
+   `SM_UNMON`, `SM_UNMON_ALL`, `SM_SIMU_CRASH` and `SM_NOTIFY`, with the loopback-only
+   checks, `mon_name` validation and the monitor records on disk, the callbacks to lockd
+   and the notify list with its retry timer, and `SIGUSR1` (reread the notify list),
+   `SIGTERM` and `SIGHUP`. The probe stands in for the kernel's lockd, both its
+   `SM_MON` calls and the callbacks statd makes to it.
+3. **Hostile input (planned):** malformed and truncated NSM calls, hostile `mon_name`s
+   (path tricks, overlong, odd characters), `SM_NOTIFY` floods and spoofed peers, a full
+   or read-only state directory, and connection floods on statd's TCP socket.
+4. **libnfsidmap and nfsidmap (planned):** `idmapd.conf` (`[General]`, `[Mapping]`,
+   `[Translation]`, `[Static]`, `[Regex]`), the default domain (from `Domain`, else DNS),
+   the `nsswitch`, `static` and `regex` methods built in, `Local-Realms`, and the
+   `nfsidmap` request-key helper (`-t`, `-c`, `-l`, `-r`, `-u`, `-g`, `-d`) with its
+   keyring writes, against the C library and helper.
+5. **rpc.idmapd (planned):** the `rpc_pipefs` client directories found by `inotify`, the
+   upcall and downcall formats, the nfsd channels under `/proc/net/rpc` (both missing, as
+   on a client, and faked), `-S`/`-C`, `-p`, `-c`, `-U`/`-G`, `-v`, `-f`, the
+   `[General]` and `[Mapping]` settings, `SIGUSR1`/`SIGUSR2`/`SIGHUP` rescans, and the
+   libevent loop's behavior, against fake pipefs trees.
+6. **Packaging (planned):** a Gentoo ebuild and a way to swap these programs in while
+   the rest of nfs-utils stays C (nfs-utils is one package, so how to do this is decided
+   in this phase), rehearsed on the test VM with rpcbind-rs, a real NFS server and client,
+   NFSv3 locks across a server reboot (statd and sm-notify doing lock recovery) and
+   NFSv4 id mapping, then rolled back through a binary package of the C build.
+
+Open questions, to settle in the phase where they come up:
+
+- Whether `libnfsidmap.so.1` also needs a C ABI. On hydra only `rpc.idmapd` and
+  `nfsidmap` link it, so the plan is a Rust library with the three methods built in.
+  A `Method` naming another plugin (`umich_ldap`, `gums`, a third-party `.so`) would then
+  fail the way C fails to `dlopen()` a missing plugin, and that difference is listed in
+  QUIRKS.md.
+- Phase 6's packaging approach (a trimmed nfs-utils ebuild in localrepo that leaves these
+  programs to `nfs-utils-rs`, or something else).
+
+Not planned unless needed: the build options hydra doesn't use (capabilities, TCP
+wrappers, LDAP and GUMS mapping, GSS principals beyond what `libnfsidmap`'s API passes
+through), and the rest of nfs-utils.
+
+## License
+
+GPL-2.0, as nfs-utils (see [LICENSE](LICENSE), upstream's `COPYING`). Some of the ported
+files carry their own permissive notices, kept in [LICENSES/](LICENSES/): the University of
+Michigan's for `libnfsidmap` and `rpc.idmapd`, and Niklas Hallqvist's and Håkan Olsson's
+for `conffile.c`. The `tirpc` crate from rpcbind-rs is BSD-3-Clause.
