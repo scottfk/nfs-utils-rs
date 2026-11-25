@@ -11,6 +11,10 @@ rust-version.workspace = true
 name = "sm-notify"
 path = "src/sm_notify.rs"
 
+[[bin]]
+name = "statd"
+path = "src/statd/main.rs"
+
 [dependencies]
 libc.workspace = true
 support = { path = "../support" }

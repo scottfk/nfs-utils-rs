@@ -205,6 +205,14 @@ impl Dir {
     }
 }
 
+impl Dir {
+    /// `dirfd()`.
+    pub fn fd(&self) -> Fd {
+        // SAFETY: self.0 is an open DIR.
+        unsafe { libc::dirfd(self.0) }
+    }
+}
+
 impl Drop for Dir {
     fn drop(&mut self) {
         // SAFETY: self.0 is an open DIR, closed once.
@@ -576,4 +584,413 @@ pub fn tolower(c: u8) -> u8 {
 /// `strcasecmp(a, b) == 0` in the C locale.
 pub fn strcaseeq(a: &[u8], b: &[u8]) -> bool {
     a.eq_ignore_ascii_case(b)
+}
+
+// ---------------------------------------------------------------------------
+// For rpc.statd: processes, descriptors, select(), the rpc and services databases.
+
+/// `fork()`.
+pub fn fork() -> i32 {
+    // SAFETY: the callers are single-threaded; the child continues with copies.
+    unsafe { libc::fork() }
+}
+
+/// `waitpid(pid, &status, 0)`: the result and the status.
+pub fn waitpid(pid: i32) -> (i32, i32) {
+    let mut st: c_int = 0;
+    // SAFETY: st is a valid out-pointer.
+    let r = unsafe { libc::waitpid(pid, &mut st, 0) };
+    (r, st)
+}
+
+/// `execv(path, argv)`; returns only on failure.
+pub fn execv(path: &[u8], argv: &[Vec<u8>]) {
+    let p = cstring(path);
+    let a: Vec<CString> = argv.iter().map(|s| cstring(s)).collect();
+    let mut ptrs: Vec<*const c_char> = a.iter().map(|s| s.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    // SAFETY: path and the NULL-terminated argv point to live C strings.
+    unsafe { libc::execv(p.as_ptr(), ptrs.as_ptr()) };
+}
+
+/// `execl(path, argv[0], ...)`: `execv()` with the list.
+pub fn execl(path: &[u8], argv: &[Vec<u8>]) {
+    execv(path, argv);
+}
+
+/// `_exit(status)`.
+pub fn _exit(status: i32) -> ! {
+    // SAFETY: ends the process.
+    unsafe { libc::_exit(status) }
+}
+
+/// `perror(s)`.
+pub fn perror(s: &[u8]) {
+    let c = cstring(s);
+    // SAFETY: a C string.
+    unsafe { libc::perror(c.as_ptr()) };
+}
+
+/// `pipe(fds)`.
+pub fn pipe() -> Option<(Fd, Fd)> {
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: fds has room for two ints.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return None;
+    }
+    Some((fds[0], fds[1]))
+}
+
+/// `dup(fd)`.
+pub fn dup(fd: Fd) -> Fd {
+    // SAFETY: no memory is involved.
+    unsafe { libc::dup(fd) }
+}
+
+/// `dup2(fd, to)`.
+pub fn dup2(fd: Fd, to: Fd) -> Fd {
+    // SAFETY: no memory is involved.
+    unsafe { libc::dup2(fd, to) }
+}
+
+/// `setsid()`.
+pub fn setsid() -> i32 {
+    // SAFETY: no memory is involved.
+    unsafe { libc::setsid() }
+}
+
+/// `ftruncate(fd, len)`.
+pub fn ftruncate(fd: Fd, len: i64) -> i32 {
+    // SAFETY: no memory is involved.
+    unsafe { libc::ftruncate(fd, len) }
+}
+
+/// `fcntl(fd, F_GETFL)`.
+pub fn getfl(fd: Fd) -> i32 {
+    // SAFETY: no memory is involved.
+    unsafe { libc::fcntl(fd, libc::F_GETFL) }
+}
+
+/// `closelog()`.
+pub fn closelog() {
+    // SAFETY: no preconditions.
+    unsafe { libc::closelog() };
+}
+
+/// `getrlimit(RLIMIT_NOFILE)`: (soft, hard), or `None`.
+pub fn getrlimit_nofile() -> Option<(u64, u64)> {
+    let mut r = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: r is a valid out-pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
+        return None;
+    }
+    Some((r.rlim_cur, r.rlim_max))
+}
+
+/// `setrlimit(RLIMIT_NOFILE, {soft, hard})`.
+pub fn setrlimit_nofile(soft: u64, hard: u64) -> i32 {
+    let r = libc::rlimit { rlim_cur: soft, rlim_max: hard };
+    // SAFETY: r is valid.
+    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) }
+}
+
+/// `system(cmd)`.
+pub fn system(cmd: &[u8]) -> i32 {
+    let c = cstring(cmd);
+    // SAFETY: a C string.
+    unsafe { libc::system(c.as_ptr()) }
+}
+
+/// `connect(fd, addr, addr.len())`.
+pub fn connect(fd: Fd, addr: &[u8]) -> i32 {
+    // SAFETY: addr is addr.len() bytes of sockaddr.
+    unsafe { libc::connect(fd, addr.as_ptr().cast(), addr.len() as libc::socklen_t) }
+}
+
+/// `getsockopt(fd, level, name, &int, &len)`.
+pub fn getsockopt_int(fd: Fd, level: i32, name: i32) -> Option<i32> {
+    let mut v: c_int = 0;
+    let mut len = size_of::<c_int>() as libc::socklen_t;
+    // SAFETY: v and len are valid out-pointers.
+    let r = unsafe { libc::getsockopt(fd, level, name, (&mut v as *mut c_int).cast(), &mut len) };
+    (r >= 0).then_some(v)
+}
+
+/// `recvfrom(fd, buf, len, 0, &sockaddr_storage, &alen)` with `alen` starting at
+/// `alen`: the length, and the address bytes the kernel wrote (`alen` of them, at most).
+pub fn recvfrom(fd: Fd, buf: &mut [u8], alen: usize) -> (isize, Vec<u8>) {
+    let mut ss = [0u8; 128];
+    let mut len = alen.min(128) as libc::socklen_t;
+    // SAFETY: buf and ss are valid for their lengths; len gives ss's usable size.
+    let n = unsafe { libc::recvfrom(fd, buf.as_mut_ptr().cast(), buf.len(), 0, ss.as_mut_ptr().cast(), &mut len) };
+    (n, ss[..alen.min(128)].to_vec())
+}
+
+/// An `fd_set`.
+pub type FdSet = libc::fd_set;
+
+/// An empty `fd_set`.
+pub fn fd_zero() -> FdSet {
+    // SAFETY: fd_set is plain bits; all-zero is the empty set.
+    unsafe { std::mem::zeroed() }
+}
+
+/// `FD_SET(fd, set)`.
+pub fn fd_set(fd: Fd, set: &mut FdSet) {
+    if (0..libc::FD_SETSIZE as i32).contains(&fd) {
+        // SAFETY: fd is within the set.
+        unsafe { libc::FD_SET(fd, set) };
+    }
+}
+
+/// `FD_CLR(fd, set)`.
+pub fn fd_clr(fd: Fd, set: &mut FdSet) {
+    if (0..libc::FD_SETSIZE as i32).contains(&fd) {
+        // SAFETY: fd is within the set.
+        unsafe { libc::FD_CLR(fd, set) };
+    }
+}
+
+/// `FD_ISSET(fd, set)`.
+pub fn fd_isset(fd: Fd, set: &FdSet) -> bool {
+    // SAFETY: fd is within the set.
+    (0..libc::FD_SETSIZE as i32).contains(&fd) && unsafe { libc::FD_ISSET(fd, set) }
+}
+
+/// `select(nfds, readfds, NULL, NULL, timeout)`, the timeout in whole seconds (`None`
+/// to wait for ever).
+pub fn select_read(nfds: i32, readfds: &mut FdSet, timeout_secs: Option<i64>) -> i32 {
+    let mut tv = libc::timeval { tv_sec: timeout_secs.unwrap_or(0), tv_usec: 0 };
+    let tvp: *mut libc::timeval = if timeout_secs.is_some() { &mut tv } else { std::ptr::null_mut() };
+    // SAFETY: readfds and tv are valid; the other sets are NULL.
+    unsafe { libc::select(nfds, readfds, std::ptr::null_mut(), std::ptr::null_mut(), tvp) }
+}
+
+/// `select(fd + 1, NULL, &wset, NULL, timeout)` for one descriptor; the timeout is
+/// updated with what remains, as Linux does.
+pub fn select_write_one(fd: Fd, timeout: &mut (i64, i64)) -> i32 {
+    let mut set = fd_zero();
+    fd_set(fd, &mut set);
+    let mut tv = libc::timeval { tv_sec: timeout.0, tv_usec: timeout.1 };
+    // SAFETY: set and tv are valid.
+    let r = unsafe { libc::select(fd + 1, std::ptr::null_mut(), &mut set, std::ptr::null_mut(), &mut tv) };
+    *timeout = (tv.tv_sec, tv.tv_usec);
+    r
+}
+
+unsafe extern "C" {
+    fn getrpcbyname(name: *const c_char) -> *mut libc::c_void;
+    fn getrpcbynumber_r(
+        number: c_int,
+        result_buf: *mut RpcEnt,
+        buf: *mut c_char,
+        buflen: libc::size_t,
+        result: *mut *mut RpcEnt,
+    ) -> c_int;
+    fn getservbyname_r(
+        name: *const c_char,
+        proto: *const c_char,
+        result_buf: *mut libc::servent,
+        buf: *mut c_char,
+        buflen: libc::size_t,
+        result: *mut *mut libc::servent,
+    ) -> c_int;
+}
+
+/// `struct rpcent`.
+#[repr(C)]
+struct RpcEnt {
+    r_name: *mut c_char,
+    r_aliases: *mut *mut c_char,
+    r_number: c_int,
+}
+
+/// `getrpcbyname(name)->r_number`.
+pub fn getrpcbyname_number(name: &[u8]) -> Option<i32> {
+    let n = cstring(name);
+    // SAFETY: a C string; the static result is read at once.
+    unsafe {
+        let e = getrpcbyname(n.as_ptr()).cast::<RpcEnt>();
+        if e.is_null() { None } else { Some((*e).r_number) }
+    }
+}
+
+/// `getservport(number, proto)` (support/nfs/svc_socket.c): the port of the service
+/// named like RPC program `number` (or one of its aliases), from the services
+/// database; 0 if none.
+pub fn getservport(number: u64, proto: &[u8]) -> u16 {
+    let p = cstring(proto);
+    let mut servdata = [0 as c_char; 1024];
+    let mut rpcdata = [0 as c_char; 1024];
+    // SAFETY: all-zero rpcent/servent are valid out-structures; the buffers are the
+    // sizes passed; the result pointers point into them.
+    unsafe {
+        let mut rpcbuf: RpcEnt = std::mem::zeroed();
+        let mut rpcp: *mut RpcEnt = std::ptr::null_mut();
+        let mut servbuf: libc::servent = std::mem::zeroed();
+        let mut servp: *mut libc::servent = std::ptr::null_mut();
+        let mut ret = getrpcbynumber_r(number as c_int, &mut rpcbuf, rpcdata.as_mut_ptr(), rpcdata.len(), &mut rpcp);
+        if ret == 0 && !rpcp.is_null() {
+            ret = getservbyname_r(
+                (*rpcp).r_name,
+                p.as_ptr(),
+                &mut servbuf,
+                servdata.as_mut_ptr(),
+                servdata.len(),
+                &mut servp,
+            );
+            if (ret != 0 || servp.is_null()) && !(*rpcp).r_aliases.is_null() {
+                let mut a = (*rpcp).r_aliases;
+                while !(*a).is_null() {
+                    ret = getservbyname_r(
+                        *a,
+                        p.as_ptr(),
+                        &mut servbuf,
+                        servdata.as_mut_ptr(),
+                        servdata.len(),
+                        &mut servp,
+                    );
+                    if ret == 0 && !servp.is_null() {
+                        break;
+                    }
+                    a = a.add(1);
+                }
+            }
+        }
+        if ret == 0 && !servp.is_null() {
+            return u16::from_be((*servp).s_port as u16);
+        }
+    }
+    0
+}
+
+/// `fwrite(b, 1, len, stdout)` on C's buffered stdout (flushed by `exit()`).
+pub fn c_stdout(b: &[u8]) {
+    unsafe extern "C" {
+        static mut stdout: *mut libc::FILE;
+    }
+    // SAFETY: stdout is the C library's stream; b is valid for its length.
+    unsafe { libc::fwrite(b.as_ptr().cast(), 1, b.len(), stdout) };
+}
+
+/// `atexit(f)`.
+pub fn atexit(f: extern "C" fn()) {
+    // SAFETY: f is a plain extern "C" function.
+    unsafe { libc::atexit(f) };
+}
+
+/// `sigaction(sig, {SIG_DFL, flags 0, empty mask}, &old)`, then later [`sigaction_restore`].
+pub fn sigaction_default(sig: i32) -> libc::sigaction {
+    // SAFETY: all-zero sigaction structures are valid; the mask is emptied.
+    unsafe {
+        let mut new: libc::sigaction = std::mem::zeroed();
+        let mut old: libc::sigaction = std::mem::zeroed();
+        new.sa_sigaction = libc::SIG_DFL;
+        libc::sigemptyset(&mut new.sa_mask);
+        libc::sigaction(sig, &new, &mut old);
+        old
+    }
+}
+
+/// `sigaction(sig, old, NULL)`.
+pub fn sigaction_restore(sig: i32, old: &libc::sigaction) {
+    // SAFETY: old came from sigaction().
+    unsafe { libc::sigaction(sig, old, std::ptr::null_mut()) };
+}
+
+/// `sigaction(SIGPIPE, {SIG_IGN}, NULL)` as `nfs_svc_create()` does (no flags, empty
+/// mask: unlike `signal()`).
+pub fn sigaction_ignore(sig: i32) {
+    // SAFETY: an all-zero sigaction is valid; the handler is SIG_IGN.
+    unsafe {
+        let mut new: libc::sigaction = std::mem::zeroed();
+        new.sa_sigaction = libc::SIG_IGN;
+        libc::sigaction(sig, &new, std::ptr::null_mut());
+    }
+}
+
+/// `sysconf(_SC_OPEN_MAX)`.
+pub fn open_max() -> i64 {
+    // SAFETY: no memory is involved.
+    unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }
+}
+
+/// `strtol(s, &end, 10)` with errno: (value, bytes used, errno set).
+pub fn strtol10(s: &[u8]) -> (i64, usize, bool) {
+    let c = cstring(s);
+    let mut end: *mut c_char = std::ptr::null_mut();
+    set_errno(0);
+    // SAFETY: a valid C string; end points into it.
+    let v = unsafe { libc::strtol(c.as_ptr(), &mut end, 10) };
+    let used = (end as usize).wrapping_sub(c.as_ptr() as usize);
+    (v, used, errno() != 0)
+}
+
+/// `listen(fd, backlog)`.
+pub fn listen(fd: Fd, backlog: i32) -> i32 {
+    // SAFETY: no memory is involved.
+    unsafe { libc::listen(fd, backlog) }
+}
+
+/// `getaddrinfo(node, NULL, hints)` with `AI_CANONNAME` possibly in `flags`: every
+/// result, and the first result's `ai_canonname` (if set), or the error code.
+pub fn getaddrinfo_canon(
+    node: &[u8],
+    flags: i32,
+    family: i32,
+    protocol: i32,
+) -> Result<(Vec<AddrInfo>, Option<Vec<u8>>), i32> {
+    let n = cstring(node);
+    // SAFETY: as in getaddrinfo(); ai_canonname is a C string when set.
+    unsafe {
+        let mut hints: libc::addrinfo = std::mem::zeroed();
+        hints.ai_flags = flags;
+        hints.ai_family = family;
+        hints.ai_protocol = protocol;
+        let mut res: *mut libc::addrinfo = std::ptr::null_mut();
+        let rc = libc::getaddrinfo(n.as_ptr(), std::ptr::null(), &hints, &mut res);
+        if rc != 0 {
+            return Err(rc);
+        }
+        let canon = if (*res).ai_canonname.is_null() {
+            None
+        } else {
+            Some(CStr::from_ptr((*res).ai_canonname).to_bytes().to_vec())
+        };
+        let mut out = Vec::new();
+        let mut p = res;
+        while !p.is_null() {
+            let a = &*p;
+            let bytes = std::slice::from_raw_parts(a.ai_addr.cast::<u8>(), a.ai_addrlen as usize).to_vec();
+            out.push(AddrInfo { family: a.ai_family, socktype: a.ai_socktype, protocol: a.ai_protocol, addr: bytes });
+            p = a.ai_next;
+        }
+        libc::freeaddrinfo(res);
+        Ok((out, canon))
+    }
+}
+
+/// `getnameinfo(sa, salen, host, buflen, NULL, 0, flags)`: the host, or the code.
+pub fn getnameinfo_len(sa: &[u8], salen: usize, buflen: usize, flags: i32) -> Result<Vec<u8>, i32> {
+    let mut buf = vec![0 as c_char; buflen.max(1)];
+    let mut ss = [0u8; 128];
+    let n = sa.len().min(128);
+    ss[..n].copy_from_slice(&sa[..n]);
+    // SAFETY: ss holds salen (at most 128) bytes of sockaddr; buf has buflen bytes.
+    let rc = unsafe {
+        libc::getnameinfo(
+            ss.as_ptr().cast(),
+            salen.min(128) as libc::socklen_t,
+            buf.as_mut_ptr(),
+            buflen as libc::socklen_t,
+            std::ptr::null_mut(),
+            0,
+            flags,
+        )
+    };
+    if rc != 0 {
+        return Err(rc);
+    }
+    // SAFETY: getnameinfo NUL-terminates on success.
+    Ok(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_bytes().to_vec())
 }
