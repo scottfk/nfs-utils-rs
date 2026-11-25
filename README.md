@@ -29,8 +29,42 @@ GSS daemons, ...) is out of scope and stays C.
 
 ## Status
 
-Planning. This branch has the plan, the project docs and the reference build; no Rust
-code yet. Next: phase 1 (groundwork and `sm-notify`).
+Phase 1 is done on branch `phase1-sm-notify`: `sm-notify` is ported, with the shared
+support code under it, and gives the same results as C in all 59 differential cases.
+Next: phase 2 (`rpc.statd`).
+
+Phase 1, groundwork and `sm-notify`:
+
+- `crates/support`: `xlog.c` (stderr and syslog, debug facilities, the `SIGUSR1` and
+  `SIGUSR2` toggles), the reading side of `conffile.c` (`/etc/nfs.conf`, `/usr/etc`,
+  the `.d` directories in version order, `include`, sections and subsections, quotes,
+  continuations, `$name` values, every parse warning, and the hash buckets and
+  transaction queue whose order decides overrides), `support/nsm/file.c` (the `state`
+  file, retiring `sm/` to `sm.bak/`, reading, adding and removing records with
+  `sscanf()`'s and `fgets()`'s behavior, the privilege drop), `support/nsm/rpc.c` (the
+  hand-built `PMAPPROC_GETPORT`, `RPCBPROC_GETADDR`, `SM_NOTIFY` and NLM calls, reply
+  parsing), and the path and universal-address helpers;
+- `sm-notify.c`: options and `[sm-notify]` settings, the pid file, `-v` names checked
+  with `getnameinfo()`, the IPv6 socket that also reaches IPv4 peers, the reserved
+  port, the notify list in send order, at most ten calls at once, exponential backoff
+  up to two minutes, a fresh port lookup and the next address after four tries (C
+  drops the first address instead of rotating it; see [QUIRKS.md](QUIRKS.md)), the
+  retry without the domain, giving up after `-m` minutes, and `daemon()`.
+- In rpcbind-rs ([PR #11](https://github.com/scottfk/rpcbind-rs/pull/11)): `tirpc`
+  gained `bindresvport_sa()` at a given address and public reply decoding, and a fix
+  for the reserved port picked for pids over 65535.
+
+The differential suite has 59 cases, all passing: options and usage, the state
+directory (missing, relative, read-only, `state` as a directory, short and even
+`state` files, `sm/` owned by root or missing), records (malformed, hex variants, a
+short line reading the line before it, long lines, bad file names, two records in one
+file), peers over IPv4 and IPv6 (lookups answered, refused, unregistered, with bad
+ports or addresses; silent peers and statds; two and three addresses; unknown names; twelve
+peers at once; denied, failed, garbage and short replies), `-v` and `-p`, and
+`nfs.conf` (settings, errors, includes, `nfs.conf.d`, environment values,
+continuations, debug facilities). Five mutants that undo reproduced quirks are
+caught: list fields trimmed, the parser's NUL not left for the next line, ties in the
+notify list not broken by age, the name cut at its last dot, and `0x` not taken.
 
 The plan and its status live in the [roadmap](#roadmap) below, which is updated as each
 step lands.
@@ -54,18 +88,20 @@ runlevel; `nfsclient` runs `sm-notify` and needs `rpc.statd` (started with
 `--no-notify`, running as `nobody`, the owner of `/var/lib/nfs/sm`) and `rpc.idmapd`;
 the kernel calls `nfsidmap` through request-key for NFSv4 id lookups.
 
-## Planned layout
+## Layout
 
 Upstream's code for these programs is about 9,000 lines of C, plus the parts of
-`support/` they use. The port follows the files:
+`support/` they use. The port follows the files (the id-mapping crates and packaging
+are still to come):
 
 | Path | What |
 |---|---|
 | `crates/support/` | the shared parts of nfs-utils' `support/`: `xlog.c`, `conffile.c` (`nfs.conf`, includes and `nfs.conf.d`), `support/nsm/file.c` (the state file, monitor records, privilege drop) and `support/nsm/rpc.c` (NSM calls built by hand), and the bits of `support/misc` and `support/nfs` they need |
-| `crates/statd/` | `utils/statd`: `rpc.statd` (`statd.c`, `monitor.c`, `notlist.c`, `rmtcall.c`, `callback.c`, `hostname.c`, `simu*.c`, `svc_run.c`) and `sm-notify` (`sm-notify.c`) |
+| `crates/support/src/sys.rs` | every libc call |
+| `crates/statd/` | `utils/statd`: `sm-notify` (`src/sm_notify.rs`), and in phase 2 `rpc.statd` (`statd.c`, `monitor.c`, `notlist.c`, `rmtcall.c`, `callback.c`, `hostname.c`, `simu*.c`, `svc_run.c`) |
 | `crates/nfsidmap/` | `support/nfsidmap`: the library and its `nsswitch`, `static` and `regex` methods |
 | `crates/idmapd/` | `utils/idmapd/idmapd.c` and `utils/nfsidmap/nfsidmap.c` |
-| `tests/` | differential tests and the harness (adapted from rpcbind-rs) |
+| `crates/statd/tests/` | differential tests and the harness (adapted from rpcbind-rs); `nsmprobe/` is the fake-peer tool |
 | `contrib/gentoo/` | packaging |
 | `tools/` | the reference build, and the checks run on the test VM |
 
@@ -76,23 +112,42 @@ PR, so rpcbind's differential suite keeps checking it.
 
 ## Testing
 
-As in rpcbind-rs: each case runs the C program and then the port in a private user,
-mount, network and pid namespace (ids mapped from your subordinate ranges, its own
-loopback, `/run`, `/var/lib/nfs` and `/etc`, `/dev/log` captured), with rpcbind-rs's
-rpcbind running inside for registrations, and compares:
+```sh
+make check
+```
 
-- every reply byte for byte, and every call the program makes, which a fake lockd and
-  fake peers in the probe record (`SM_NOTIFY` to monitored hosts, the callbacks to
-  lockd, and their retries on a fake clock);
-- stdout, stderr, the exit status and every syslog line;
-- the registrations left in rpcbind, the sockets bound, and the files under
-  `/var/lib/nfs` and `/run` (names, modes, owners, contents);
-- for id mapping, the answers through a fake `rpc_pipefs` tree and the request-key
-  interface, with users and groups from the sandbox's own `/etc/passwd` and `/etc/group`.
+This builds the C reference into `../nfs-utils` if it isn't there, then runs the unit
+tests and the differential suite ([crates/statd/tests/](crates/statd/tests/)). As in
+rpcbind-rs, each case runs the C program and then the port in a private user, mount,
+network, pid and UTS namespace (ids mapped from your subordinate ranges, so there's a
+real root and `nobody` exists), with its own loopback, `/run`, `/var/lib/nfs` (with
+the case's records), `/etc` (links to the host's files, plus the case's `hosts`,
+`nfs.conf` and `nfs.conf.d`), `/dev/log` captured, and regular files bound over
+`/proc/sys/fs/nfs/nsm_local_state` and `/proc/fs/lockd/nlm_end_grace`. It compares:
+
+- every call the program makes, which fake peers record byte for byte with the source
+  address and port (`nsmprobe`: scripted rpcbind and statd answers, from refusals and
+  garbage to silence);
+- stdout, stderr, the exit status and every syslog line (time stamps and pids
+  normalized);
+- the files under `/var/lib/nfs` and `/run` (names, modes, owners, contents), and what
+  was written to the kernel's files.
+
+The programs run on a fake clock (the LD_PRELOAD shim in `crates/statd/tests/shim/`)
+whose `poll()` timeouts pass at once, so fifteen minutes of retries take a moment. The
+script forks the same processes in the same order every time, so pids, and with them
+the xids and reserved ports, come out the same in both runs; the probe answers in the
+order calls arrived. To see what each case produced:
+`NFSUTILS_DIFF_SHOW=1 cargo test -- --nocapture`. Each run's files stay in
+`target/difftest/<case>/{c,r}/`.
+
+For `rpc.statd` (phase 2) the sandbox will add rpcbind-rs for registrations and a fake
+lockd; for id mapping (phases 4 and 5), a fake `rpc_pipefs` tree and the request-key
+interface.
 
 ## Roadmap
 
-1. **Groundwork and sm-notify (planned):** the workspace and the `tirpc` dependency;
+1. **Groundwork and sm-notify (done, branch phase1-sm-notify):** the workspace and the `tirpc` dependency;
    `crates/support` (`xlog`, `nfs.conf` parsing, `support/nsm`); the test harness; and
    `sm-notify`: options and `[sm-notify]` settings, the state number bump, the lock and
    the `-f` check, privilege drop, the `sm` to `sm.bak` move, and the `SM_NOTIFY` calls

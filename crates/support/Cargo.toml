@@ -1,0 +1,15 @@
+[package]
+name = "support"
+description = "The parts of nfs-utils' support/ that rpc.statd, sm-notify and the id-mapping programs use"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libc.workspace = true
+tirpc.workspace = true
+
+[lints]
+workspace = true
