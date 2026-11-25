@@ -29,7 +29,7 @@ GSS daemons, ...) is out of scope and stays C.
 
 ## Status
 
-Phase 1 is done on branch `phase1-sm-notify`: `sm-notify` is ported, with the shared
+Phase 1 is done ([PR #2](https://github.com/scottfk/nfs-utils-rs/pull/2), branch `phase1-sm-notify`): `sm-notify` is ported, with the shared
 support code under it, and gives the same results as C in all 59 differential cases.
 Next: phase 2 (`rpc.statd`).
 
@@ -147,7 +147,7 @@ interface.
 
 ## Roadmap
 
-1. **Groundwork and sm-notify (done, branch phase1-sm-notify):** the workspace and the `tirpc` dependency;
+1. **Groundwork and sm-notify (done, PR #2):** the workspace and the `tirpc` dependency;
    `crates/support` (`xlog`, `nfs.conf` parsing, `support/nsm`); the test harness; and
    `sm-notify`: options and `[sm-notify]` settings, the state number bump, the lock and
    the `-f` check, privilege drop, the `sm` to `sm.bak` move, and the `SM_NOTIFY` calls
