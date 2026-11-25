@@ -317,6 +317,20 @@ fn reply_garbage() {
     );
 }
 
+/// Replies are matched by xid only: the rpcbind answer comes from another address and
+/// sends the `SM_NOTIFY` to another port, and that answer, from another address too, ends
+/// the host's notification.
+#[test]
+fn reply_spoofed_address() {
+    check(
+        case("reply_spoofed_address", &["-d", "-m", "2"])
+            .notify("peer-a", &[&record("peer-a", "client")])
+            .peer("rpcbind-a 127.0.0.2 111 port:32766@127.0.0.9")
+            .peer("statd-a 127.0.0.2 32765 void")
+            .peer("evil-a 127.0.0.2 32766 void@127.0.0.9"),
+    );
+}
+
 #[test]
 fn reply_short_getport() {
     check(

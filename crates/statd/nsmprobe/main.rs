@@ -9,7 +9,9 @@
 //!   - `uaddr:STR` - success with the XDR string STR (an `RPCBPROC_GETADDR` answer);
 //!   - `accept:N` - accepted with status N;
 //!   - `denied` - denied, RPC version mismatch (2-2);
-//!   - `hex:HEX` - these bytes, with `XID` standing for the call's xid.
+//!   - `hex:HEX` - these bytes, with `XID` standing for the call's xid;
+//!   - `ACTION@ADDR` - ACTION's answer, sent from a new socket on ADDR (any port): a
+//!     spoofed reply.
 //! - `ready FIFO` - write "ready" to FIFO (the test script waits on it).
 //! - `serve STOPFILE` - answer until STOPFILE exists, then print the log: one
 //!   `NAME got HEX from ADDR PORT` line per datagram, in arrival order (a port from
@@ -39,6 +41,17 @@
 //!   is a newline).
 //! - `expect-n FILE N TEXT...` - until FILE contains TEXT N times.
 //! - `finish FIFO` - write "done" to FIFO.
+//! - `timeout MS` - how long `call`, `raw` and `recv` wait for a reply (5000 at first).
+//! - `conn NAME [N]` - open N (1) TCP connections to statd from 127.0.0.1; logs how many
+//!   connected.
+//! - `send NAME HEX` - write HEX (`XID` stands for a new xid) on NAME's first connection.
+//! - `recv NAME` - read one record from it: `NAME reply HEX`, `NAME closed` or
+//!   `NAME no reply`.
+//! - `alive NAME` - how many of NAME's connections statd has closed.
+//! - `close NAME` - close NAME's connections.
+//! - `clock SECS FILE` - move the fake clock in FILE on by SECS seconds.
+//! - `fds` - how many descriptors statd has open, once that stops changing.
+//! - `sh CMD...` - run CMD with `sh -c`; logs its status if it isn't 0.
 //!
 //! Single-threaded on purpose: the sandbox's pids must come out the same in every run.
 //! Each round takes every waiting datagram from every peer, then logs and answers them
@@ -183,10 +196,23 @@ fn pump(peers: &mut [Peer], log: &mut Vec<String>) -> bool {
         let port = if from.port() >= 32768 { "eph".to_string() } else { from.port().to_string() };
         log.push(format!("{} got {} from {} {port}", p.name, hex(&msg), from.ip()));
         let xid = if msg.len() >= 4 { u32::from_be_bytes(msg[..4].try_into().unwrap()) } else { 0 };
-        let a = &p.actions[p.count.min(p.actions.len() - 1)];
+        let a = p.actions[p.count.min(p.actions.len() - 1)].clone();
         p.count += 1;
-        if let Some(r) = answer(a, xid) {
-            let _ = p.sock.send_to(&r, from);
+        let (a, via) = match a.split_once('@') {
+            Some((a, ip)) => (a.to_string(), Some(ip.parse::<std::net::IpAddr>().unwrap())),
+            None => (a, None),
+        };
+        if let Some(r) = answer(&a, xid) {
+            match via {
+                None => {
+                    let _ = p.sock.send_to(&r, from);
+                }
+                Some(ip) => {
+                    if let Ok(s) = UdpSocket::bind(SocketAddr::new(ip, 0)) {
+                        let _ = s.send_to(&r, from);
+                    }
+                }
+            }
         }
     }
     true
@@ -209,6 +235,54 @@ struct StatdState {
     port: Option<u16>,
     xid: u32,
     pid: Option<i32>,
+    /// statd's TCP port, once looked up.
+    tcp_port: Option<u16>,
+    /// How long to wait for a reply (ms); 0 means the default, 5000.
+    timeout: u64,
+    /// Open connections by name, each with the bytes read from it so far.
+    conns: Vec<(String, TcpStream, Vec<u8>)>,
+}
+
+impl StatdState {
+    fn timeout(&self) -> u64 {
+        if self.timeout == 0 { 5000 } else { self.timeout }
+    }
+
+    fn next_xid(&mut self) -> u32 {
+        self.xid += 1;
+        0x0c00_0000 + self.xid
+    }
+}
+
+/// A non-blocking TCP connection from 127.0.0.1 to 127.0.0.1:`port`, or `None` if it
+/// isn't made within 500 ms.
+fn tcp_connect(port: u16) -> Option<TcpStream> {
+    let dst: SocketAddr = SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port);
+    let t = TcpStream::connect_timeout(&dst, Duration::from_millis(500)).ok()?;
+    t.set_nonblocking(true).unwrap();
+    Some(t)
+}
+
+/// One record (the last fragment's) from the start of `got`, if it's all there.
+fn take_record(got: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let mut off = 0;
+    let mut rec = Vec::new();
+    loop {
+        if got.len() < off + 4 {
+            return None;
+        }
+        let h = u32::from_be_bytes(got[off..off + 4].try_into().unwrap());
+        let l = (h & 0x7fff_ffff) as usize;
+        if got.len() < off + 4 + l {
+            return None;
+        }
+        rec.extend_from_slice(&got[off + 4..off + 4 + l]);
+        off += 4 + l;
+        if h & 0x8000_0000 != 0 {
+            got.drain(..off);
+            return Some(rec);
+        }
+    }
 }
 
 /// A call message: xid, CALL, RPC version 2, prog/vers/proc, AUTH_NONE twice, args.
@@ -285,6 +359,19 @@ fn tcp_call(
             libc::close(fd);
             return None;
         }
+    }
+    // Closed with a reset, not a FIN: a closed connection would sit in TIME_WAIT, and the
+    // next call from the same port couldn't connect.
+    let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+    // SAFETY: a linger option on our socket.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&linger as *const libc::linger).cast(),
+            size_of::<libc::linger>() as libc::socklen_t,
+        );
     }
     // SAFETY: fd is a connected socket we own.
     let mut t = unsafe { TcpStream::from_raw_fd(fd) };
@@ -446,17 +533,17 @@ fn statd_cmd(cmd: &str, f: &[&str], peers: &mut [Peer], log: &mut Vec<String>, s
             }
             let ip: std::net::IpAddr = f[3].parse().unwrap();
             let src = SocketAddr::new(ip, f[4].parse().unwrap());
-            st.xid += 1;
-            let xid = 0x0c00_0000 + st.xid;
+            let xid = st.next_xid();
+            let ms = st.timeout();
             let msg = if cmd == "call" {
                 call_msg(xid, 100024, 1, f[5].parse().unwrap(), &unhex(f.get(6).copied().unwrap_or("")))
             } else {
-                unhex(&f[5].replace("XID", &format!("{xid:08x}")))
+                unhex(&f.get(5).copied().unwrap_or("").replace("XID", &format!("{xid:08x}")))
             };
             let r = if f[2] == "tcp" {
-                tcp_call(peers, log, src, port, &msg, 5000)
+                tcp_call(peers, log, src, port, &msg, ms)
             } else {
-                udp_call(peers, log, src, port, &msg, 5000)
+                udp_call(peers, log, src, port, &msg, ms)
             };
             match r {
                 Some(b) => log.push(format!("{} reply {}", f[1], hex(&b))),
@@ -477,6 +564,137 @@ fn statd_cmd(cmd: &str, f: &[&str], peers: &mut [Peer], log: &mut Vec<String>, s
             }
         }
         "pause" => pump_for(peers, log, f[1].parse().unwrap()),
+        "timeout" => st.timeout = f[1].parse().unwrap(),
+        "conn" => {
+            if st.port.unwrap_or(0) == 0 {
+                return true;
+            }
+            if st.tcp_port.is_none() {
+                st.tcp_port = rpcb_call(peers, log, any_v4(), 2, 3, &words(&[100024, 1, 6, 0]))
+                    .filter(|b| b.len() >= 4)
+                    .map(|b| u32::from_be_bytes(b[..4].try_into().unwrap()) as u16);
+            }
+            let port = st.tcp_port.unwrap_or(0);
+            let n: usize = f.get(2).map_or(1, |x| x.parse().unwrap());
+            let mut ok = 0;
+            for _ in 0..n {
+                if let Some(t) = tcp_connect(port) {
+                    st.conns.push((f[1].to_string(), t, Vec::new()));
+                    ok += 1;
+                }
+                pump(peers, log);
+            }
+            log.push(format!("{} connected {ok}", f[1]));
+        }
+        "send" => {
+            let xid = st.next_xid();
+            let msg = unhex(&f[2].replace("XID", &format!("{xid:08x}")));
+            if let Some((_, t, _)) = st.conns.iter_mut().find(|c| c.0 == f[1]) {
+                let mut off = 0;
+                let end = Instant::now() + Duration::from_millis(st.timeout.max(5000));
+                while off < msg.len() && Instant::now() < end {
+                    match t.write(&msg[off..]) {
+                        Ok(n) => off += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if !pump(peers, log) {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if off < msg.len() {
+                    log.push(format!("{} sent {off} of {}", f[1], msg.len()));
+                }
+            }
+        }
+        "recv" => {
+            let ms = st.timeout();
+            let Some(c) = st.conns.iter_mut().find(|c| c.0 == f[1]) else { return true };
+            let end = Instant::now() + Duration::from_millis(ms);
+            let mut buf = [0u8; 65536];
+            let r = loop {
+                if let Some(rec) = take_record(&mut c.2) {
+                    break format!("{} reply {}", f[1], hex(&rec));
+                }
+                if Instant::now() >= end {
+                    break format!("{} no reply", f[1]);
+                }
+                match c.1.read(&mut buf) {
+                    Ok(0) => break format!("{} closed", f[1]),
+                    Ok(n) => c.2.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if !pump(peers, log) {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                    Err(_) => break format!("{} closed", f[1]),
+                }
+            };
+            log.push(r);
+        }
+        "alive" => {
+            pump_for(peers, log, 20);
+            let mut buf = [0u8; 65536];
+            let (mut open, mut closed) = (0, 0);
+            for c in st.conns.iter_mut().filter(|c| c.0 == f[1]) {
+                loop {
+                    match c.1.read(&mut buf) {
+                        Ok(0) => {
+                            closed += 1;
+                            break;
+                        }
+                        Ok(n) => c.2.extend_from_slice(&buf[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            open += 1;
+                            break;
+                        }
+                        Err(_) => {
+                            closed += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            log.push(format!("{} open {open} closed {closed}", f[1]));
+        }
+        "close" => {
+            st.conns.retain(|c| c.0 != f[1]);
+            pump_for(peers, log, 20);
+        }
+        "clock" => {
+            use std::os::unix::fs::FileExt;
+            let secs: i64 = f[1].parse().unwrap();
+            let text = std::fs::read_to_string(f[2]).unwrap();
+            let mut w = text.split_whitespace();
+            let (s0, ns): (i64, i64) = (w.next().unwrap().parse().unwrap(), w.next().unwrap().parse().unwrap());
+            // In place and at the same width: the programs have the file mapped.
+            let new = format!("{:020} {ns:09}\n", s0 + secs);
+            std::fs::OpenOptions::new().write(true).open(f[2]).unwrap().write_all_at(new.as_bytes(), 0).unwrap();
+        }
+        "fds" => {
+            // Once the count has held for 300 ms (statd may still be accepting).
+            st.pid = statd_pid().or(st.pid);
+            if let Some(pid) = st.pid {
+                let count = || std::fs::read_dir(format!("/proc/{pid}/fd")).map_or(0, |d| d.count());
+                let (mut n, mut same) = (count(), 0);
+                let end = Instant::now() + Duration::from_secs(20);
+                while same < 15 && Instant::now() < end {
+                    pump_for(peers, log, 20);
+                    let m = count();
+                    same = if m == n { same + 1 } else { 0 };
+                    n = m;
+                }
+                log.push(format!("statd fds {n}"));
+            }
+        }
+        "sh" => {
+            let cmd = f[1..].join(" ");
+            let st = std::process::Command::new("/bin/sh").arg("-c").arg(&cmd).status().unwrap();
+            if !st.success() {
+                log.push(format!("sh {cmd}: {st}"));
+            }
+        }
         "kill" => {
             let sig = match f[1] {
                 "TERM" => libc::SIGTERM,
