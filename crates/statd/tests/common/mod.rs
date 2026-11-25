@@ -40,6 +40,8 @@
 
 #![allow(dead_code)]
 
+pub mod statd;
+
 use std::ffi::{CString, c_char, c_int};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
@@ -141,6 +143,11 @@ pub struct Case {
     pub probe: Vec<String>,
     /// nsmprobe commands run before the program starts (after the peers).
     pub before: Vec<String>,
+    /// The program's descriptor limit (`ulimit -n`), if not the default.
+    pub nofile: Option<u32>,
+    /// Collapse runs of the same line on stderr (a busy loop's log, whose length is
+    /// timing).
+    pub squeeze: bool,
 }
 
 impl Case {
@@ -159,6 +166,8 @@ impl Case {
             rpcbind: prog == "rpc.statd",
             probe: Vec::new(),
             before: Vec::new(),
+            nofile: None,
+            squeeze: false,
         }
         .owner_setup()
     }
@@ -213,6 +222,18 @@ impl Case {
     /// A probe command (rpc.statd).
     pub fn probe(mut self, line: &str) -> Case {
         self.probe.push(line.to_string());
+        self
+    }
+
+    /// Run the program with `ulimit -n n`.
+    pub fn nofile(mut self, n: u32) -> Case {
+        self.nofile = Some(n);
+        self
+    }
+
+    /// Collapse runs of the same stderr line into one, marked ` (repeated)`.
+    pub fn squeeze(mut self) -> Case {
+        self.squeeze = true;
         self
     }
 
@@ -511,6 +532,7 @@ exit 0
                     "\"$R/bin/{prog}\""
                 },
             )
+            .replace("(env ", &case.nofile.map_or("(env ".to_string(), |n| format!("(ulimit -n {n} && env ")))
             .replace("{poll}", &case.poll_ms.to_string())
             .replace("{env}", &env.join(" "))
             .replace("{prog}", &case.prog)
@@ -638,7 +660,7 @@ pub fn run(case: &Case, bins: &[(&str, PathBuf)], label: &str) -> Outcome {
     Outcome {
         status: read(&t, "out/status").trim().to_string(),
         stdout: fix(read(&t, "out/stdout")),
-        stderr: fix(read(&t, "out/stderr")),
+        stderr: if case.squeeze { squeeze(&fix(read(&t, "out/stderr"))) } else { fix(read(&t, "out/stderr")) },
         syslog: syslog.into_iter().map(fix).collect(),
         peers,
         state: read(&t, "out/state"),
@@ -651,6 +673,25 @@ pub fn run(case: &Case, bins: &[(&str, PathBuf)], label: &str) -> Outcome {
             read(&t, "out/nlm_udpport")
         ),
     }
+}
+
+/// Runs of the same line as one, marked ` (repeated)`.
+fn squeeze(s: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut last: Option<&str> = None;
+    for l in s.split_inclusive('\n') {
+        if last == Some(l) {
+            if let Some(o) = out.last_mut()
+                && !o.ends_with(" (repeated)\n")
+            {
+                *o = format!("{} (repeated)\n", o.trim_end_matches('\n'));
+            }
+            continue;
+        }
+        last = Some(l);
+        out.push(l.to_string());
+    }
+    out.concat()
 }
 
 /// Run both and compare; returns the C outcome.

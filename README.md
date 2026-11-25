@@ -29,11 +29,11 @@ GSS daemons, ...) is out of scope and stays C.
 
 ## Status
 
-Phases 1 and 2 are done: `sm-notify` (merged, PR #2) and `rpc.statd` (branch
-`phase2-statd`, PR #3) are ported, with the shared support code under them, and give
-the same results as C in all 59 and 74 differential cases. Phase 2 needs rpcbind-rs
-[PR #12](https://github.com/scottfk/rpcbind-rs/pull/12) (the pinned `tirpc` commit).
-Next: phase 3 (hostile input).
+Phases 1 to 3 are done: `sm-notify` (PR #2) and `rpc.statd` (PR #3) are ported and
+merged, with the shared support code under them, and phase 3 (branch `phase3-hostile`,
+PR #4) puts both through hostile input. They give the same results as C in all 60
+sm-notify, 74 statd and 27 hostile-input differential cases. Next: phase 4
+(libnfsidmap and nfsidmap).
 
 Phase 1, groundwork and `sm-notify`:
 
@@ -77,6 +77,34 @@ Phase 2, `rpc.statd`:
   gained `svc_tli_create()` with its own socket, `svc_reg()` registering with rpcbind,
   `rpcb_set()`, and `svc_fdset`/`svc_getreqset()`.
 
+Phase 3, hostile input (tests only; the port needed no changes):
+
+- malformed calls: `SM_MON` cut at every field over UDP (completed from the
+  transport's buffer) and TCP, the other procedures cut short, strings at and past
+  `SM_MAXSTRLEN` and absurd lengths, bad RPC headers (a reply, RPC version 3,
+  `AUTH_SYS` and unknown credentials, credentials over 400 bytes, short, empty and
+  oversized messages), and record marking (fragments, zero-length and oversized
+  records, half records);
+- hostile names: canonical names from the resolver that are `..`, `.`, `a/b`, format
+  directives, 300 bytes long, `sm.bak` or `-rf` (records are named after them),
+  records with such names loaded at startup, control characters, high bytes, quotes
+  and shell syntax in `mon_name` and `my_name`, and hostile `SM_NOTIFY` names passed
+  to an ha-callout;
+- `SM_NOTIFY` floods (twenty state changes against a silent lockd, fifty repeats, forty
+  sources) and spoofed senders, and callback replies from another port, another
+  address, or garbage; in sm-notify, replies from another address;
+- the state directory read-only, on a read-only mount, out of space or inodes, and
+  records that are directories, symlinks, or hold a NUL;
+- connection floods: past the descriptor limit (32, and statd's own cap of 1024) on a
+  stopped clock, where descriptors run out and name lookups fail; the idle sweep on a
+  moving clock, which holds statd at 820; and connections holding half a record.
+
+The probe gained persistent TCP connections (`conn`, `send`, `recv`, `alive`,
+`close`), spoofed replies (`ACTION@ADDR`), a clock step and a descriptor count; cases
+can set a descriptor limit and collapse a busy loop's repeated log lines. Three
+mutants (no `/` check on record names, the record appended at the end instead of at
+a NUL, callback replies taken from any address) each fail a case.
+
 The statd suite has 74 cases: options and usage, bad ports, `nfs.conf` (ports, name,
 `no-notify`, `ha-callout`, state directory, debug to syslog), lockd's ports, starting
 and stopping (fixed, random and privileged ports, no rpcbind, already running, a stale
@@ -91,13 +119,13 @@ after start and after exit. Mutating five behaviors that C has and the port copi
 (the stale `SM_UNMON_ALL` result, the try count, the state check before callbacks, the
 callout message, the white space fix) each fails a case.
 
-The sm-notify suite has 59 cases, all passing: options and usage, the state
+The sm-notify suite has 60 cases, all passing: options and usage, the state
 directory (missing, relative, read-only, `state` as a directory, short and even
 `state` files, `sm/` owned by root or missing), records (malformed, hex variants, a
 short line reading the line before it, long lines, bad file names, two records in one
 file), peers over IPv4 and IPv6 (lookups answered, refused, unregistered, with bad
 ports or addresses; silent peers and statds; two and three addresses; unknown names; twelve
-peers at once; denied, failed, garbage and short replies), `-v` and `-p`, and
+peers at once; denied, failed, garbage, short and spoofed replies), `-v` and `-p`, and
 `nfs.conf` (settings, errors, includes, `nfs.conf.d`, environment values,
 continuations, debug facilities). Five mutants that undo reproduced quirks are
 caught: list fields trimmed, the parser's NUL not left for the next line, ties in the
@@ -182,7 +210,9 @@ For `rpc.statd` the sandbox adds the system's rpcbind (rpcbind-rs on hydra, the 
 in both runs) and the implementation's own sm-notify; the probe stands in for lockd
 (registered with rpcbind, answering callbacks), sends the SM calls, signals statd once
 it's idle in `select()`, and dumps rpcbind's table. The clock's `select()` timeouts pass
-at once too. For id mapping (phases 4 and 5) it will add a fake `rpc_pipefs` tree and
+at once too. For the hostile-input cases the probe also holds TCP connections open
+(hundreds at once, half records, records split oddly), sends replies from other
+addresses, steps the clock, and counts statd's descriptors. For id mapping (phases 4 and 5) it will add a fake `rpc_pipefs` tree and
 the request-key interface.
 
 ## Roadmap
@@ -202,7 +232,7 @@ the request-key interface.
    and the notify list with its retry timer, and `SIGUSR1` (restart the loop and rerun
    sm-notify), `SIGTERM` and `SIGHUP`. The probe stands in for the kernel's lockd, both its
    `SM_MON` calls and the callbacks statd makes to it.
-3. **Hostile input (planned):** malformed and truncated NSM calls, hostile `mon_name`s
+3. **Hostile input (done, PR #4):** malformed and truncated NSM calls, hostile `mon_name`s
    (path tricks, overlong, odd characters), `SM_NOTIFY` floods and spoofed peers, a full
    or read-only state directory, and connection floods on statd's TCP socket.
 4. **libnfsidmap and nfsidmap (planned):** `idmapd.conf` (`[General]`, `[Mapping]`,
