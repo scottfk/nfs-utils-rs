@@ -1,0 +1,26 @@
+[package]
+name = "statd"
+description = "Drop-in Rust port of rpc.statd and sm-notify from nfs-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sm-notify"
+path = "src/sm_notify.rs"
+
+[dependencies]
+libc.workspace = true
+support = { path = "../support" }
+tirpc.workspace = true
+
+[lints]
+workspace = true
+
+# Test tool for the differential tests (not installed).
+[[bin]]
+name = "nsmprobe"
+path = "nsmprobe/main.rs"
+test = false
