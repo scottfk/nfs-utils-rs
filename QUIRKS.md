@@ -30,7 +30,7 @@ means it's cosmetic or hard to hit.
 | low | A line longer than the buffer (1,095 bytes) is read as several lines. Removing a notified host from such a file then fails ("could not parse original file") and leaves the file as it was. | `nsm_file::fgets` | `records_long_line` |
 | low | Rewriting a record file after a removal reformats the remaining records (`%08x`, lowercase cookie), and fails ("could not construct output record") if that comes out longer than the file was. | `nsm_file::nsm_create_monitor_record` | `records_hex_variants` |
 | low | After a short read of the `state` file, the warning's `%m` is whatever `errno` was before (`No such file or directory`, from an earlier lookup). | `nsm_file::nsm_get_state` | `state_short_file` |
-| low | Adding a record to a file that contains a NUL byte puts the new line at the NUL (`strcat()`), and the bytes after it are written as zeros. | `nsm_file::nsm_append_monitored_host` | phase 2 |
+| low | Adding a record to a file that contains a NUL byte puts the new line at the NUL (`strcat()`), and the bytes after it are written as zeros. | `nsm_file::nsm_append_monitored_host` | phase 3 |
 
 ## sm-notify (utils/statd/sm-notify.c)
 
@@ -44,3 +44,20 @@ means it's cosmetic or hard to hit.
 | low | `Backgrounding to notify hosts...` has a newline in its format, so the syslog message ends in one. | `main` | `notify_backgrounded` |
 | low | After a successful `SM_NOTIFY`, the name sent (the record's `my_name`, or `-v`'s) is cut at its first dot and sent again, so `a.b.c` is tried as `a.b.c`, then as `a`, never as `a.b`. | `Smn::recv_reply` | `notify_one_peer` |
 | low | `generic_setup_basedir()`'s errors (`-P`) go to stderr with the full `argv[0]` and without a newline. | `misc::generic_setup_basedir` | `state_dir_missing`, `state_dir_relative`, `state_dir_too_long` |
+
+## rpc.statd (utils/statd/)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| medium | When exec'ing sm-notify fails, the forked child's `exit(2)` runs statd's own exit handlers: it empties `/run/rpc.statd.pid`, and in the loop after `SM_SIMU_CRASH` (by then `statd_unregister` is one of them) it also removes statd's registrations from rpcbind while statd keeps running. | `run_sm_notify` | `sm_notify_missing` |
+| medium | A callback to lockd gets five tries in all, and asking the portmapper for lockd's port uses one: lockd is called at most four times. | `rmtcall::process_entry` | `callback_retries_give_up` |
+| low | A refused (remote) `SM_UNMON_ALL` returns the static result as the last call left it: state 0 before any local call, the state number after. | `monitor::sm_unmon_all` | `unmon_all_remote_stale_state` |
+| low | After `SM_SIMU_CRASH` statd runs sm-notify again, but as the owner of `sm/`; sm-notify finds the first run's `/run/sm-notify.pid`, can't replace it, and exits ("Already notifying clients"): the hosts are never notified again. | `main` | `simu_crash` |
+| low | `my_svc_run()` loops while a callback is due at or before now, but `process_notify_list()` only sends those due strictly before now: each retry first spins on `time()` for up to a second. (Not observable in the tests: the fake clock's `select()` moves on to where the spin would end.) | `my_svc_run` | - |
+| low | If no reserved port can be bound for the callback socket, statd goes on with the socket unbound (lockd then sees calls from an unprivileged port). | `rmtcall::statd_get_socket` | - |
+| low | The listeners are made after dropping privileges, so `-p` (or `port`) below 1024 fails without capabilities (this build has none) and statd exits. | `main` | `privileged_port` |
+| low | `SM_MON` and `SM_UNMON` turn white space in `my_name` into `_`; `SM_UNMON_ALL` doesn't. | `monitor` | `mon_white_space` |
+| low | An `SM_MON` with a new cookie whose record can't be written drops the existing entry from the monitor list (its record was already deleted). | `monitor::sm_mon` | - |
+| low | `ha callout returned %d\n` has a newline in its format (a blank line on stderr), and reports 255 if the fork failed. | `monitor::ha_callout` | `ha_callout` |
+| low | A call whose arguments are cut short is decoded with what earlier datagrams left in the transport's buffer (zeros at first): a short `SM_MON` gets `my_name` "", program 0. This is tirpc's `svc_dg` (see rpcbind-rs's QUIRKS.md). | `tirpc::svc` | `garbage_arguments` |
+| low | A transport whose `svc_reg()` (registration with rpcbind) fails stays open and is served anyway; statd only exits if none succeeded. | `svc_create` | `no_rpcbind` |

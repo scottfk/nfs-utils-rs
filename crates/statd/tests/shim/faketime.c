@@ -10,6 +10,7 @@
  * 20261122 - Map the file once, so reading the clock needs no descriptor - Claude - scottfk
  * 20261125 - Copied from rpcbind-rs for the nfs-utils-rs tests - Claude - scottfk
  * 20261125 - Virtual poll() timeouts ($TEST_VIRTUAL_POLL) - Claude - scottfk
+ * 20261125 - Virtual select() timeouts, for rpc.statd - Claude - scottfk
  *
  * If $TEST_FAKETIME names a readable file holding "SECONDS NANOSECONDS",
  * time(), gettimeofday() and clock_gettime(CLOCK_REALTIME) return that
@@ -36,6 +37,12 @@
  * run in moments.  Replies from the test's fake peers arrive well within
  * the real wait.
  *
+ * select() with a timeout works the same way, except that a timeout that
+ * passes moves the clock on to the start of the second after it.  rpc.statd
+ * waits until a callback is due and then, finding it due only "this second",
+ * spins on time() until the next second begins; this is where the real clock
+ * would be when the spin ends.
+ *
  * Build: cc -shared -fPIC -O2 -o faketime.so faketime.c -ldl
  */
 #define _GNU_SOURCE
@@ -51,6 +58,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <poll.h>
+#include <sys/select.h>
 
 static int fake(struct timespec *ts)
 {
@@ -273,4 +281,38 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout)
     if (r == 0)
         advance_ms(timeout);
     return r;
+}
+
+int select(int nfds, fd_set *restrict r, fd_set *restrict w, fd_set *restrict e,
+           struct timeval *restrict timeout)
+{
+    static int (*real)(int, fd_set *, fd_set *, fd_set *, struct timeval *);
+    const char *v = getenv("TEST_VIRTUAL_POLL");
+    struct timeval tv;
+    struct timespec ts;
+    long ms;
+    int res;
+
+    if (!real)
+        real = (int (*)(int, fd_set *, fd_set *, fd_set *, struct timeval *)) dlsym(RTLD_NEXT, "select");
+    if (!v || !getenv("TEST_FAKETIME") || !timeout || (timeout->tv_sec <= 0 && timeout->tv_usec <= 0))
+        return real(nfds, r, w, e, timeout);
+    ms = timeout->tv_sec * 1000 + timeout->tv_usec / 1000;
+    tv.tv_sec = atoi(v) / 1000;
+    tv.tv_usec = (atoi(v) % 1000) * 1000;
+    if (ms < atoi(v)) {
+        tv.tv_sec = timeout->tv_sec;
+        tv.tv_usec = timeout->tv_usec;
+    }
+    res = real(nfds, r, w, e, &tv);
+    if (res == 0) {
+        advance_ms(ms);
+        if (fake(&ts) && ts.tv_nsec != 0)
+            advance_ms((1000000000L - ts.tv_nsec) / 1000000L);
+        else
+            advance_ms(1000);
+        timeout->tv_sec = 0;
+        timeout->tv_usec = 0;
+    }
+    return res;
 }

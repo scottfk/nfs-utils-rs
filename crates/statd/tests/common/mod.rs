@@ -17,14 +17,20 @@
 //! - its own `/etc`: a tmpfs of links to the host's files, with the case's files
 //!   (`hosts`, `nfs.conf`, `nfs.conf.d/...`) in place of the links;
 //! - its own `/var/lib/nfs` (`T/nfs`), with the case's files;
-//! - regular files over `/proc/sys/fs/nfs/nsm_local_state` and
-//!   `/proc/fs/lockd/nlm_end_grace`, so what it writes to the kernel is seen;
+//! - regular files over `/proc/sys/fs/nfs/nsm_local_state`, `nlm_tcpport`,
+//!   `nlm_udpport` and `/proc/fs/lockd/nlm_end_grace`, so what it writes to the
+//!   kernel is seen;
+//! - for rpc.statd, a real rpcbind (the system's, the same in both runs; its syslog
+//!   messages are left out), and the program's own sm-notify over
+//!   `/usr/sbin/sm-notify`;
 //! - fake peers from `nsmprobe`, started first (it says when it's ready through a FIFO);
 //! - a fake clock (the shim in `tests/shim/`) whose `poll()` timeouts pass at once.
 //!
 //! Then it runs the program, waits for it and for any daemon()ized child to finish,
 //! stops the probe, and records the state directory and `/run`. `/dev/log` is a socket
-//! the harness reads.
+//! the harness reads. rpc.statd runs in the background while the probe works through
+//! the case's commands (calls, signals, rpcbind dumps); the probe says when it's done
+//! through a second FIFO, after stopping statd.
 //!
 //! The script forks the same processes in the same order in every run, so the pids,
 //! and with them the xids and reserved ports the programs pick, come out the same.
@@ -62,6 +68,10 @@ pub fn reference_binary(prog: &str) -> PathBuf {
 
 pub fn rust_sm_notify() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_sm-notify"))
+}
+
+pub fn rust_statd() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_statd"))
 }
 
 pub fn probe_binary() -> PathBuf {
@@ -124,6 +134,13 @@ pub struct Case {
     pub poll_ms: u32,
     /// The program's environment additions (`NAME=value`).
     pub env: Vec<String>,
+    /// rpc.statd: start rpcbind first.
+    pub rpcbind: bool,
+    /// rpc.statd: the nsmprobe commands run once the program was started (after
+    /// `ready`), before `finish`. `@T@` stands for the sandbox's `T`.
+    pub probe: Vec<String>,
+    /// nsmprobe commands run before the program starts (after the peers).
+    pub before: Vec<String>,
 }
 
 impl Case {
@@ -139,6 +156,9 @@ impl Case {
             peers: Vec::new(),
             poll_ms: 1000,
             env: Vec::new(),
+            rpcbind: prog == "rpc.statd",
+            probe: Vec::new(),
+            before: Vec::new(),
         }
         .owner_setup()
     }
@@ -171,6 +191,28 @@ impl Case {
 
     pub fn peer(mut self, line: &str) -> Case {
         self.peers.push(line.to_string());
+        self
+    }
+
+    /// A probe command run before the program starts.
+    pub fn before(mut self, line: &str) -> Case {
+        self.before.push(line.to_string());
+        self
+    }
+
+    /// Wait until statd's stderr has `text` (a probe command).
+    pub fn expect(self, text: &str) -> Case {
+        self.probe(&format!("expect @T@/out/stderr {text}"))
+    }
+
+    /// Wait until statd's stderr has `text` `n` times (a probe command).
+    pub fn expect_n(self, n: usize, text: &str) -> Case {
+        self.probe(&format!("expect-n @T@/out/stderr {n} {text}"))
+    }
+
+    /// A probe command (rpc.statd).
+    pub fn probe(mut self, line: &str) -> Case {
+        self.probe.push(line.to_string());
         self
     }
 
@@ -394,25 +436,53 @@ done
 (cd "$R/etc" && find . -type d | while read d; do mkdir -p "/etc/$d"; done
  find . -type f | while read f; do rm -f "/etc/$f"; cp "$f" "/etc/$f"; done) || exit 95
 mount --bind "$R/nfs" /var/lib/nfs || exit 96
-: >"$R/out/nsm_local_state"; : >"$R/out/nlm_end_grace"
+: >"$R/out/nsm_local_state"; : >"$R/out/nlm_end_grace"; : >"$R/out/nlm_tcpport"; : >"$R/out/nlm_udpport"
 [ -e /proc/sys/fs/nfs/nsm_local_state ] && mount --bind "$R/out/nsm_local_state" /proc/sys/fs/nfs/nsm_local_state
 [ -e /proc/fs/lockd/nlm_end_grace ] && mount --bind "$R/out/nlm_end_grace" /proc/fs/lockd/nlm_end_grace
+[ -e /proc/sys/fs/nfs/nlm_tcpport ] && mount --bind "$R/out/nlm_tcpport" /proc/sys/fs/nfs/nlm_tcpport
+[ -e /proc/sys/fs/nfs/nlm_udpport ] && mount --bind "$R/out/nlm_udpport" /proc/sys/fs/nfs/nlm_udpport
 (cd "$R/state" && find . -type d | while read d; do mkdir -p "/var/lib/nfs/$d"; done
  find . -type f | while read f; do cp "$f" "/var/lib/nfs/$f"; done) || exit 97
 "#
     );
+    let statd = case.prog == "rpc.statd";
+    if statd {
+        // Before the case's setup, which may replace it.
+        s.push_str(
+            r#"[ -e /usr/sbin/sm-notify ] && mount --bind "$R/bin/sm-notify" /usr/sbin/sm-notify
+"#,
+        );
+    }
     for l in &case.setup {
         s.push_str(l);
         s.push('\n');
     }
+    if case.rpcbind {
+        s.push_str(
+            r#"
+/sbin/rpcbind -f >"$R/out/rpcbind" 2>&1 &
+RBPID=$!
+"#,
+        );
+    }
+    let launch = if statd {
+        r#"mkfifo "$R/out/finish"
+(env LD_PRELOAD="$R/bin/faketime.so" TEST_FAKETIME="$R/faketime" TEST_VIRTUAL_POLL={poll} {env} "$R/bin/{prog}" {args}) >"$R/out/stdout" 2>"$R/out/stderr" </dev/null &
+wait $!
+echo "exit $?" >"$R/out/status"
+: >"$R/out/launched"
+read x <"$R/out/finish""#
+    } else {
+        r#"(env LD_PRELOAD="$R/bin/faketime.so" TEST_FAKETIME="$R/faketime" TEST_VIRTUAL_POLL={poll} {env} "$R/bin/{prog}" {args}) >"$R/out/stdout" 2>"$R/out/stderr" </dev/null
+echo "exit $?" >"$R/out/status""#
+    };
     s.push_str(&format!(
         r#"
 mkfifo "$R/out/ready"
 "$R/bin/nsmprobe" <"$R/probe.in" >"$R/out/peers" 2>&1 &
 PPID_=$!
 read x <"$R/out/ready"
-(env LD_PRELOAD="$R/bin/faketime.so" TEST_FAKETIME="$R/faketime" TEST_VIRTUAL_POLL={poll} {env} "$R/bin/{prog}" {args}) >"$R/out/stdout" 2>"$R/out/stderr" </dev/null
-echo "exit $?" >"$R/out/status"
+{launch}
 pids() {{ for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "{comm}" ] && echo ${{p#/proc/}}; done; }}
 j=0
 while [ -n "$(pids)" ] && [ $j -lt 3000 ]; do sleep 0.01; j=$((j+1)); done
@@ -432,12 +502,24 @@ chown -R 0:0 "$R/nfs" "$R/out" 2>/dev/null
 chmod -R u+rwX "$R/nfs" 2>/dev/null
 exit 0
 "#,
-        poll = case.poll_ms,
-        env = env.join(" "),
-        prog = case.prog,
-        args = args.join(" "),
+        launch = launch
+            .replace(
+                "\"$R/bin/{prog}\"",
+                if std::env::var_os("NFSUTILS_STRACE").is_some() {
+                    "strace -f -tt -o \"$R/out/strace\" \"$R/bin/{prog}\""
+                } else {
+                    "\"$R/bin/{prog}\""
+                },
+            )
+            .replace("{poll}", &case.poll_ms.to_string())
+            .replace("{env}", &env.join(" "))
+            .replace("{prog}", &case.prog)
+            .replace("{args}", &args.join(" ")),
         comm = case.prog.chars().take(15).collect::<String>(),
     ));
+    if case.rpcbind {
+        s = s.replace("\nexit 0\n", "\nkill $RBPID 2>/dev/null; wait $RBPID 2>/dev/null\nexit 0\n");
+    }
     s
 }
 
@@ -485,7 +567,7 @@ fn write_files(dir: &Path, files: &[(String, Vec<u8>)]) {
 }
 
 /// Run one implementation of the case's program.
-pub fn run(case: &Case, bin: &Path, label: &str) -> Outcome {
+pub fn run(case: &Case, bins: &[(&str, PathBuf)], label: &str) -> Outcome {
     let base = workspace_dir().join("target/difftest").join(&case.name);
     let t = base.join(label);
     clean(&t);
@@ -500,7 +582,9 @@ pub fn run(case: &Case, bin: &Path, label: &str) -> Outcome {
             std::fs::copy(src, &d).unwrap();
         }
     };
-    link(bin, &format!("bin/{}", case.prog));
+    for (name, bin) in bins {
+        link(bin, &format!("bin/{name}"));
+    }
     link(&probe_binary(), "bin/nsmprobe");
     link(&shim(), "bin/faketime.so");
     std::fs::write(t.join("faketime"), format!("{EPOCH:020} 000000000\n")).unwrap();
@@ -511,7 +595,17 @@ pub fn run(case: &Case, bin: &Path, label: &str) -> Outcome {
     write_files(&t.join("state"), &case.state);
     let root = fixed_root();
     let mut probe: Vec<String> = case.peers.iter().map(|l| format!("peer {l}")).collect();
+    if case.rpcbind {
+        probe.insert(0, "await-rpcbind".into());
+    }
+    let at_t = |l: &String| l.replace("@T@", root.to_str().unwrap());
+    probe.extend(case.before.iter().map(at_t));
     probe.push(format!("ready {}/out/ready", root.display()));
+    if case.prog == "rpc.statd" {
+        probe.push(format!("await-statd {}/out/launched", root.display()));
+        probe.extend(case.probe.iter().map(at_t));
+        probe.push(format!("finish {}/out/finish", root.display()));
+    }
     probe.push(format!("serve {}/out/stop", root.display()));
     std::fs::write(t.join("probe.in"), probe.join("\n") + "\n").unwrap();
 
@@ -532,7 +626,11 @@ pub fn run(case: &Case, bin: &Path, label: &str) -> Outcome {
     let mut syslog = Vec::new();
     let mut buf = vec![0u8; 65536];
     while let Ok(n) = log.recv(&mut buf) {
-        syslog.push(render_syslog(&buf[..n]));
+        let m = render_syslog(&buf[..n]);
+        // The sandbox's rpcbind is the same in both runs.
+        if !m.contains("> rpcbind[") && !m.contains(">rpcbind[") {
+            syslog.push(m);
+        }
     }
     let peers = read(&t, "out/peers");
     assert!(peers.ends_with("probe done\n"), "{}/{label}: the probe failed:\n{peers}", case.name);
@@ -546,21 +644,27 @@ pub fn run(case: &Case, bin: &Path, label: &str) -> Outcome {
         state: read(&t, "out/state"),
         run: read(&t, "out/run"),
         kernel: format!(
-            "nsm_local_state={:?} nlm_end_grace={:?}",
+            "nsm_local_state={:?} nlm_end_grace={:?} nlm_tcpport={:?} nlm_udpport={:?}",
             read(&t, "out/nsm_local_state"),
-            read(&t, "out/nlm_end_grace")
+            read(&t, "out/nlm_end_grace"),
+            read(&t, "out/nlm_tcpport"),
+            read(&t, "out/nlm_udpport")
         ),
     }
 }
 
 /// Run both and compare; returns the C outcome.
 pub fn check(case: Case) -> Outcome {
-    let (c_bin, r_bin) = match case.prog.as_str() {
-        "sm-notify" => (reference_binary("sm-notify"), rust_sm_notify()),
+    let (c_bins, r_bins) = match case.prog.as_str() {
+        "sm-notify" => (vec![("sm-notify", reference_binary("sm-notify"))], vec![("sm-notify", rust_sm_notify())]),
+        "rpc.statd" => (
+            vec![("rpc.statd", reference_binary("statd")), ("sm-notify", reference_binary("sm-notify"))],
+            vec![("rpc.statd", rust_statd()), ("sm-notify", rust_sm_notify())],
+        ),
         p => panic!("unknown program {p}"),
     };
-    let c = run(&case, &c_bin, "c");
-    let r = run(&case, &r_bin, "r");
+    let c = run(&case, &c_bins, "c");
+    let r = run(&case, &r_bins, "r");
     if std::env::var_os("NFSUTILS_DIFF_SHOW").is_some() {
         eprintln!("=== {} ===\n{c:#?}", case.name);
     }

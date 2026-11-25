@@ -28,7 +28,7 @@ dependencies = [
 [[package]]
 name = "tirpc"
 version = "0.1.0"
-source = "git+https://github.com/scottfk/rpcbind-rs?rev=8751f2e98a36cbd1fde958a65465f0506c8c0352#8751f2e98a36cbd1fde958a65465f0506c8c0352"
+source = "git+https://github.com/scottfk/rpcbind-rs?rev=570ed926efbdba862016e736524d452c1c90e804#570ed926efbdba862016e736524d452c1c90e804"
 dependencies = [
  "libc",
 ]

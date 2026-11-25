@@ -29,9 +29,11 @@ GSS daemons, ...) is out of scope and stays C.
 
 ## Status
 
-Phase 1 is done ([PR #2](https://github.com/scottfk/nfs-utils-rs/pull/2), branch `phase1-sm-notify`): `sm-notify` is ported, with the shared
-support code under it, and gives the same results as C in all 59 differential cases.
-Next: phase 2 (`rpc.statd`).
+Phases 1 and 2 are done: `sm-notify` (merged, PR #2) and `rpc.statd` (branch
+`phase2-statd`, PR #3) are ported, with the shared support code under them, and give
+the same results as C in all 59 and 74 differential cases. Phase 2 needs rpcbind-rs
+[PR #12](https://github.com/scottfk/rpcbind-rs/pull/12) (the pinned `tirpc` commit).
+Next: phase 3 (hostile input).
 
 Phase 1, groundwork and `sm-notify`:
 
@@ -54,7 +56,42 @@ Phase 1, groundwork and `sm-notify`:
   gained `bindresvport_sa()` at a given address and public reply decoding, and a fix
   for the reserved port picked for pids over 65535.
 
-The differential suite has 59 cases, all passing: options and usage, the state
+Phase 2, `rpc.statd`:
+
+- `statd.c`: options and `[statd]`/`[lockd]` settings, `RPC_STATD_NO_NOTIFY`, the
+  check for a running statd (`nfs_probe_statd()`: a portmap lookup and a NULL call,
+  from `getport.c` and `rpc_socket.c`), lockd's ports through `/proc`, `daemon_init()`
+  and `daemon_ready()` (`mydaemon.c`, `closeall.c`), the pid file, running sm-notify
+  (and `-N`), unregistering, the privilege drop, and the signal handlers and exit
+  handlers in C's order;
+- `svc_create.c`: a listener on each visible `/etc/netconfig` transport, at `-p`, the
+  services database's port, or a random one, registered with rpcbind;
+- `monitor.c`, `stat.c`, `simu.c`, `callback.c` and the rpcgen dispatcher: `SM_MON`,
+  `SM_UNMON`, `SM_UNMON_ALL`, `SM_STAT`, `SM_SIMU_CRASH` and `SM_NOTIFY`, with the
+  loopback and reserved-port checks, name checks, the static results, the records, and
+  `-H` callouts;
+- `hostname.c` (canonical names and matching by name or address), `notlist.c` (the
+  linked lists, as C links them), `rmtcall.c` (the callback socket, the port lookup and
+  NLM callbacks with five tries) and `svc_run.c` (the `select()` loop);
+- In rpcbind-rs ([PR #12](https://github.com/scottfk/rpcbind-rs/pull/12)): `tirpc`
+  gained `svc_tli_create()` with its own socket, `svc_reg()` registering with rpcbind,
+  `rpcb_set()`, and `svc_fdset`/`svc_getreqset()`.
+
+The statd suite has 74 cases: options and usage, bad ports, `nfs.conf` (ports, name,
+`no-notify`, `ha-callout`, state directory, debug to syslog), lockd's ports, starting
+and stopping (fixed, random and privileged ports, no rpcbind, already running, a stale
+registration, daemon mode, `sm/` owned by root, records loaded at startup, sm-notify
+run with `-p`/`-v` or failing to run), each procedure from lockd, from remote hosts
+and over TCP (duplicates, new cookies, aliases and addresses, IPv6, unknown hosts,
+bad names, white space and NULs in names), callbacks (by name and by address, two
+monitors, lockd unregistered, silent or answering with an error), ha-callouts,
+`SM_SIMU_CRASH`, `SIGUSR1`/`SIGUSR2`/`SIGHUP`/`SIGTERM`, and odd calls (unknown
+procedure, version or program, garbage arguments). The rpcbind table is compared
+after start and after exit. Mutating five behaviors that C has and the port copies
+(the stale `SM_UNMON_ALL` result, the try count, the state check before callbacks, the
+callout message, the white space fix) each fails a case.
+
+The sm-notify suite has 59 cases, all passing: options and usage, the state
 directory (missing, relative, read-only, `state` as a directory, short and even
 `state` files, `sm/` owned by root or missing), records (malformed, hex variants, a
 short line reading the line before it, long lines, bad file names, two records in one
@@ -98,7 +135,7 @@ are still to come):
 |---|---|
 | `crates/support/` | the shared parts of nfs-utils' `support/`: `xlog.c`, `conffile.c` (`nfs.conf`, includes and `nfs.conf.d`), `support/nsm/file.c` (the state file, monitor records, privilege drop) and `support/nsm/rpc.c` (NSM calls built by hand), and the bits of `support/misc` and `support/nfs` they need |
 | `crates/support/src/sys.rs` | every libc call |
-| `crates/statd/` | `utils/statd`: `sm-notify` (`src/sm_notify.rs`), and in phase 2 `rpc.statd` (`statd.c`, `monitor.c`, `notlist.c`, `rmtcall.c`, `callback.c`, `hostname.c`, `simu*.c`, `svc_run.c`) |
+| `crates/statd/` | `utils/statd`: `sm-notify` (`src/sm_notify.rs`) and `rpc.statd` (`src/statd/`: `statd.c` and `svc_run.c` in `main.rs`, `monitor.c` with `stat.c`, `simu.c` and `callback.c`, `notlist.c`, `rmtcall.c`, `hostname.c`); the binary is built as `statd` and installed as `rpc.statd` |
 | `crates/nfsidmap/` | `support/nfsidmap`: the library and its `nsswitch`, `static` and `regex` methods |
 | `crates/idmapd/` | `utils/idmapd/idmapd.c` and `utils/nfsidmap/nfsidmap.c` |
 | `crates/statd/tests/` | differential tests and the harness (adapted from rpcbind-rs); `nsmprobe/` is the fake-peer tool |
@@ -141,9 +178,12 @@ order calls arrived. To see what each case produced:
 `NFSUTILS_DIFF_SHOW=1 cargo test -- --nocapture`. Each run's files stay in
 `target/difftest/<case>/{c,r}/`.
 
-For `rpc.statd` (phase 2) the sandbox will add rpcbind-rs for registrations and a fake
-lockd; for id mapping (phases 4 and 5), a fake `rpc_pipefs` tree and the request-key
-interface.
+For `rpc.statd` the sandbox adds the system's rpcbind (rpcbind-rs on hydra, the same
+in both runs) and the implementation's own sm-notify; the probe stands in for lockd
+(registered with rpcbind, answering callbacks), sends the SM calls, signals statd once
+it's idle in `select()`, and dumps rpcbind's table. The clock's `select()` timeouts pass
+at once too. For id mapping (phases 4 and 5) it will add a fake `rpc_pipefs` tree and
+the request-key interface.
 
 ## Roadmap
 
@@ -153,14 +193,14 @@ interface.
    the `-f` check, privilege drop, the `sm` to `sm.bak` move, and the `SM_NOTIFY` calls
    (address lookup, `PMAPPROC_GETPORT` and retries with backoff, `-m`, `-n`, `-p`,
    `-v`, `-P`, `-d`), against fake peers.
-2. **rpc.statd (planned):** startup (options, `[statd]` settings, `-p`/`-o` ports,
+2. **rpc.statd (done, PR #3):** startup (options, `[statd]` settings, `-p`/`-o` ports,
    `-n`, `-P`, `-H` ha-callout, `-T`/`-U` lockd ports, `-N`, `-F`/`-d`, the pid file,
    the privilege drop to the `sm/` owner, unregistering stale entries, running
    `sm-notify` unless `--no-notify`), and the protocol: `SM_STAT`, `SM_MON`,
    `SM_UNMON`, `SM_UNMON_ALL`, `SM_SIMU_CRASH` and `SM_NOTIFY`, with the loopback-only
    checks, `mon_name` validation and the monitor records on disk, the callbacks to lockd
-   and the notify list with its retry timer, and `SIGUSR1` (reread the notify list),
-   `SIGTERM` and `SIGHUP`. The probe stands in for the kernel's lockd, both its
+   and the notify list with its retry timer, and `SIGUSR1` (restart the loop and rerun
+   sm-notify), `SIGTERM` and `SIGHUP`. The probe stands in for the kernel's lockd, both its
    `SM_MON` calls and the callbacks statd makes to it.
 3. **Hostile input (planned):** malformed and truncated NSM calls, hostile `mon_name`s
    (path tricks, overlong, odd characters), `SM_NOTIFY` floods and spoofed peers, a full

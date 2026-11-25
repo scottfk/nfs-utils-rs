@@ -15,10 +15,13 @@ macro_rules! bfmt {
 }
 
 pub mod conffile;
+pub mod getport;
 pub mod misc;
+pub mod mydaemon;
 pub mod nsm_file;
 pub mod nsm_rpc;
 pub mod sockaddr;
+pub mod svc_create;
 pub mod sys;
 pub mod xlog;
 
