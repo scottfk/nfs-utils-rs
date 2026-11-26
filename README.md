@@ -29,12 +29,13 @@ GSS daemons, ...) is out of scope and stays C.
 
 ## Status
 
-Phases 1 to 4 are done. `sm-notify` (PR #2) and `rpc.statd` (PR #3) are ported and
-merged, with the shared support code under them, and phase 3 (PR #4) put both through
-hostile input. Phase 4 (branch `phase4-idmap`, PR #5) ports `libnfsidmap`, with its
-three methods built in, and `nfsidmap`. They give the same results as C in all 60
-sm-notify, 74 statd, 27 hostile-input, 41 libnfsidmap and 59 nfsidmap differential
-cases. Next: phase 5 (`rpc.idmapd`).
+Phases 1 to 5 are done. `sm-notify` (PR #2) and `rpc.statd` (PR #3) are ported and
+merged, with the shared support code under them, phase 3 (PR #4) put both through
+hostile input, and phase 4 (PR #5) ported `libnfsidmap`, with its three methods built
+in, and `nfsidmap`. Phase 5 (branch `phase5-idmapd`, PR #6) ports `rpc.idmapd`, with
+the parts of libevent it uses. They give the same results as C in all 60 sm-notify, 74
+statd, 27 hostile-input, 41 libnfsidmap, 59 nfsidmap and 59 rpc.idmapd differential
+cases. Next: phase 6 (packaging, and the rehearsal on the test VM).
 
 Phase 1, groundwork and `sm-notify`:
 
@@ -164,6 +165,36 @@ at the first `@`, the method list not moving on, `0` taken for any owner, `ENFIL
 a full keyring, a TXT name not skipped, the whole regex match taken, the first static
 mapping taken) each fail a case.
 
+Phase 5, `rpc.idmapd`:
+
+- `idmapd.c` (`crates/idmapd/src/idmapd/main.rs`): both passes over the options, the
+  deprecated `-c` and the `[General]`/`[Mapping]` settings from `nfs.conf` and
+  `idmapd.conf`, `daemon_init()`, nfsd's two channels under `/proc/net/rpc` (text
+  upcalls with `\ooo` escapes, answers with an expiry, the cache flush), the NFS
+  client's `idmap` pipes under `rpc_pipefs/nfs/clnt*` (binary `struct idmap_msg`s,
+  answered in place), the scans by inotify, one-shot watches for pipes not there yet,
+  `SIGUSR1`/`SIGUSR2`/`SIGHUP`/`SIGTERM`/`SIGINT`, and the client cache timeout;
+- what it uses of libevent 2.1 (`ev.rs`): the epoll backend, with its descriptors
+  opened in the same order (descriptor numbers matter here: the `SIGUSR1` rescan reads
+  descriptor 10, see QUIRKS.md), its `epoll_ctl()` calls and warnings, the signal
+  self-pipe, timers due at once, the order ready events run in, `loopexit`, and its
+  errors when descriptors run out.
+
+The suite (59 cases) runs the program in the background while the probe plays the
+kernel: options and usage, `-c` (missing, a directory, twice), the settings and where
+each is read from, `-p` up to and past `PATH_MAX`, unknown `nobody` users and groups in
+the foreground and as a daemon, a failing method, verbosity, cache expiries, server-
+and client-only modes and their signals, nfsd's channels (present, half present,
+without flush files, reset, at end of file, reopened by `SIGHUP`), nfsd's upcalls
+(each direction and type, failures and `nobody`, escapes and bad escapes, bad and
+missing fields, field and answer lengths, no newline, odd ids), the client's messages
+(lookups, unknown conversions and types, bytes after the name, 127- and 128-byte
+names, a reset pipe), and the scans (new clients, removed ones, the order, odd
+entries, a regular file for a pipe, waiting for a pipe, long names, the pipefs
+directory removed, `SIGUSR1` reading descriptor 10 in the layouts where that blocks
+and where it doesn't, forty clients), with the program's descriptors compared after
+each step. Ten mutants (the first scan not run at once, the signal number not passed as the descriptor, an escape moving on three bytes, the room check for an escape, the NUL check on the name itself, a 30-byte client id, both nfsd channels always opened, `LOOKUPFAIL` left alone, libevent's warning text, and the expiry written for any non-zero value) each fail a case.
+
 The plan and its status live in the [roadmap](#roadmap) below, which is updated as each
 step lands.
 
@@ -189,8 +220,7 @@ the kernel calls `nfsidmap` through request-key for NFSv4 id lookups.
 ## Layout
 
 Upstream's code for these programs is about 9,000 lines of C, plus the parts of
-`support/` they use. The port follows the files (`rpc.idmapd` and packaging are still
-to come):
+`support/` they use. The port follows the files (packaging is still to come):
 
 | Path | What |
 |---|---|
@@ -198,9 +228,9 @@ to come):
 | `crates/support/src/sys.rs` | every libc call |
 | `crates/statd/` | `utils/statd`: `sm-notify` (`src/sm_notify.rs`) and `rpc.statd` (`src/statd/`: `statd.c` and `svc_run.c` in `main.rs`, `monitor.c` with `stat.c`, `simu.c` and `callback.c`, `notlist.c`, `rmtcall.c`, `hostname.c`); the binary is built as `statd` and installed as `rpc.statd` |
 | `crates/nfsidmap/` | `support/nfsidmap`: the library and its `nsswitch`, `static` and `regex` methods |
-| `crates/idmapd/` | `utils/nfsidmap/nfsidmap.c` (`src/nfsidmap.rs`), and `utils/idmapd/idmapd.c` in phase 5 |
+| `crates/idmapd/` | `utils/nfsidmap/nfsidmap.c` (`src/nfsidmap.rs`) and `utils/idmapd/idmapd.c` (`src/idmapd/`: `main.rs`, and `ev.rs` for libevent); the binary is built as `idmapd` and installed as `rpc.idmapd` |
 | `crates/statd/tests/` | differential tests and the harness (adapted from rpcbind-rs); `nsmprobe/` is the fake-peer tool |
-| `crates/idmapd/tests/` | the id-mapping differential tests (with the harness from `crates/statd/tests/`), the fake keyring (`shim/fakekeys.c`), and the C library driver (`tools/idmaptest.c`; `tools/idmaptest.rs` is the Rust one) |
+| `crates/idmapd/tests/` | the id-mapping differential tests (with the harness from `crates/statd/tests/`), the fake keyring (`shim/fakekeys.c`) and kernel channels (`shim/fakepipes.c`), and the C library driver (`tools/idmaptest.c`; `tools/idmaptest.rs` is the Rust one) |
 | `contrib/gentoo/` | packaging |
 | `tools/` | the reference build, and the checks run on the test VM |
 
@@ -256,7 +286,20 @@ bound over `/usr/lib64/libnfsidmap` (which must exist on the host). Keys can't c
 from the kernel in a sandbox, so a second LD_PRELOAD shim (`crates/idmapd/tests/shim/`)
 answers libkeyutils' and the port's `keyctl()` and `request_key()` calls from a file of
 fake keys, with failures injected on request, and logs each call for comparison;
-`/proc/keys` is a file bound over it. Phase 5 will add a fake `rpc_pipefs` tree.
+`/proc/keys` is a file bound over it.
+
+For `rpc.idmapd` the probe plays the kernel. nfsd's channels and the client's pipes are
+Unix `SOCK_SEQPACKET` sockets the probe listens on, at the paths the program opens: a
+third LD_PRELOAD shim (`crates/idmapd/tests/shim/fakepipes.c`) turns a read-write
+`open()` of a socket into a connection to it (a regular file or a FIFO can't stand in:
+epoll refuses the one, and the other hands the program its own answer back), and moves
+`/proc/net/rpc`, which can't be mounted over, to a directory of the run. The probe
+makes the `rpc_pipefs` tree (client directories, pipes, odd entries), sends upcalls
+and messages and logs the answers, closes and resets connections, signals the program,
+and lists its descriptors. After each step it waits until the program has handled it:
+woken (its count of voluntary context switches moved) and back in `epoll_wait()`, or
+else blocked somewhere, which is logged. A file is bound over
+`/proc/sys/fs/nfs/idmap_cache_timeout`, and the cache flush files are compared.
 
 ## Roadmap
 
@@ -283,7 +326,7 @@ fake keys, with failures injected on request, and logs each call for comparison;
    the `nsswitch`, `static` and `regex` methods built in, `Local-Realms`, and the
    `nfsidmap` request-key helper (`-t`, `-c`, `-l`, `-r`, `-u`, `-g`, `-d`) with its
    keyring writes, against the C library and helper.
-5. **rpc.idmapd (planned):** the `rpc_pipefs` client directories found by `inotify`, the
+5. **rpc.idmapd (done, PR #6):** the `rpc_pipefs` client directories found by `inotify`, the
    upcall and downcall formats, the nfsd channels under `/proc/net/rpc` (both missing, as
    on a client, and faked), `-S`/`-C`, `-p`, `-c`, `-U`/`-G`, `-v`, `-f`, the
    `[General]` and `[Mapping]` settings, `SIGUSR1`/`SIGUSR2`/`SIGHUP` rescans, and the

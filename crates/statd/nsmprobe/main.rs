@@ -61,10 +61,15 @@
 //! - `fds` - how many descriptors statd has open, once that stops changing.
 //! - `sh CMD...` - run CMD with `sh -c`; logs its status if it isn't 0.
 //!
+//! For rpc.idmapd, the kernel's side of its channels and its `rpc_pipefs` tree: see
+//! [`idmapd`].
+//!
 //! Single-threaded on purpose: the sandbox's pids must come out the same in every run.
 //! Each round takes every waiting datagram from every peer, then logs and answers them
 //! in the order the kernel received them (`SO_TIMESTAMPNS`), so the program under test
 //! sees its replies in the same order however the rounds fall.
+
+mod idmapd;
 
 use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
@@ -942,6 +947,7 @@ fn main() {
     let mut peers: Vec<Peer> = Vec::new();
     let mut log: Vec<String> = Vec::new();
     let mut st = StatdState::default();
+    let mut ist = idmapd::IdmapdState::default();
     let mut printed = 0;
     for line in script {
         // Each command's log lines as soon as it's done, so a hang shows where.
@@ -993,6 +999,7 @@ fn main() {
                     }
                 }
             }
+            Some(cmd) if idmapd::cmd(cmd, &f, &line, &mut peers, &mut log, &mut ist) => {}
             Some(cmd) if statd_cmd(cmd, &f, &mut peers, &mut log, &mut st) => {}
             Some(other) => panic!("unknown command {other}"),
         }
