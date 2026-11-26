@@ -1,0 +1,33 @@
+[package]
+name = "idmapd"
+description = "Drop-in Rust port of rpc.idmapd and nfsidmap from nfs-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "nfsidmap"
+path = "src/nfsidmap.rs"
+
+[dependencies]
+libc.workspace = true
+nfsidmap = { path = "../nfsidmap" }
+support = { path = "../support" }
+
+[lints]
+workspace = true
+
+# Test tools for the differential tests (not installed): the statd crate's fake-peer
+# tool (built here too, as idprobe, so these tests have it), and a driver for the
+# library's calls.
+[[bin]]
+name = "idprobe"
+path = "../statd/nsmprobe/main.rs"
+test = false
+
+[[bin]]
+name = "idmaptest"
+path = "tools/idmaptest.rs"
+test = false

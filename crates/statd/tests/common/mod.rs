@@ -61,26 +61,48 @@ pub fn reference_dir() -> PathBuf {
     std::env::var_os("NFSUTILS_REFERENCE").map_or_else(|| workspace_dir().join("../nfs-utils"), PathBuf::from)
 }
 
-/// A program of the reference: `sm-notify` or `statd`.
-pub fn reference_binary(prog: &str) -> PathBuf {
-    let p = reference_dir().join("utils/statd").join(prog);
+/// A file of the reference build tree (`utils/statd/statd`,
+/// `utils/nfsidmap/.libs/nfsidmap`...).
+pub fn reference_file(rel: &str) -> PathBuf {
+    let p = reference_dir().join(rel);
     assert!(p.exists(), "no C reference at {} (run tools/build-reference.sh)", p.display());
     p
 }
 
+/// A program of the reference's `utils/statd`: `sm-notify` or `statd`.
+pub fn reference_binary(prog: &str) -> PathBuf {
+    reference_file(&format!("utils/statd/{prog}"))
+}
+
+/// A binary of the crate these tests belong to (the harness is shared by the statd
+/// and idmapd crates, each with its own programs).
+fn own_bin(path: Option<&'static str>, name: &str) -> PathBuf {
+    PathBuf::from(path.unwrap_or_else(|| panic!("{name} isn't built by this crate")))
+}
+
 pub fn rust_sm_notify() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_sm-notify"))
+    own_bin(option_env!("CARGO_BIN_EXE_sm-notify"), "sm-notify")
 }
 
 pub fn rust_statd() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_statd"))
+    own_bin(option_env!("CARGO_BIN_EXE_statd"), "statd")
 }
 
+pub fn rust_nfsidmap() -> PathBuf {
+    own_bin(option_env!("CARGO_BIN_EXE_nfsidmap"), "nfsidmap")
+}
+
+pub fn rust_idmaptest() -> PathBuf {
+    own_bin(option_env!("CARGO_BIN_EXE_idmaptest"), "idmaptest")
+}
+
+/// nsmprobe (built by the idmapd crate as idprobe).
 pub fn probe_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_nsmprobe"))
+    own_bin(option_env!("CARGO_BIN_EXE_nsmprobe").or(option_env!("CARGO_BIN_EXE_idprobe")), "nsmprobe")
 }
 
-/// Build a C helper once into target/difftest/.tools.
+/// Build a C helper once into target/difftest/.tools, from `src` (relative to the
+/// workspace).
 fn build_tool(name: &str, args: &[&str], src: &str, libs: &[&str]) -> PathBuf {
     let dir = workspace_dir().join("target/difftest/.tools");
     std::fs::create_dir_all(&dir).unwrap();
@@ -90,7 +112,7 @@ fn build_tool(name: &str, args: &[&str], src: &str, libs: &[&str]) -> PathBuf {
         .args(args)
         .arg("-o")
         .arg(&tmp)
-        .arg(manifest_dir().join(src))
+        .arg(workspace_dir().join(src))
         .args(libs)
         .status()
         .expect("cc");
@@ -99,11 +121,36 @@ fn build_tool(name: &str, args: &[&str], src: &str, libs: &[&str]) -> PathBuf {
     out
 }
 
-/// tests/shim/faketime.c, the LD_PRELOAD clock.
+/// crates/statd/tests/shim/faketime.c, the LD_PRELOAD clock.
 pub fn shim() -> PathBuf {
     static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BUILT
-        .get_or_init(|| build_tool("faketime.so", &["-shared", "-fPIC", "-O2"], "tests/shim/faketime.c", &["-ldl"]))
+        .get_or_init(|| {
+            build_tool("faketime.so", &["-shared", "-fPIC", "-O2"], "crates/statd/tests/shim/faketime.c", &["-ldl"])
+        })
+        .clone()
+}
+
+/// crates/idmapd/tests/shim/fakekeys.c, the LD_PRELOAD keyring.
+pub fn keys_shim() -> PathBuf {
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            build_tool("fakekeys.so", &["-shared", "-fPIC", "-O2"], "crates/idmapd/tests/shim/fakekeys.c", &["-ldl"])
+        })
+        .clone()
+}
+
+/// crates/idmapd/tests/tools/idmaptest.c, the library driver, built against the
+/// reference libnfsidmap.
+pub fn c_idmaptest() -> PathBuf {
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let inc = format!("-I{}", reference_file("support/nfsidmap").display());
+            let lib = format!("-L{}", reference_file("support/nfsidmap/.libs").display());
+            build_tool("idmaptest-c", &["-O2", &inc], "crates/idmapd/tests/tools/idmaptest.c", &[&lib, "-lnfsidmap"])
+        })
         .clone()
 }
 
@@ -148,6 +195,10 @@ pub struct Case {
     /// Collapse runs of the same line on stderr (a busy loop's log, whose length is
     /// timing).
     pub squeeze: bool,
+    /// Files under `T` (relative path, contents), written before the run.
+    pub files: Vec<(String, Vec<u8>)>,
+    /// A command the program runs under (`setpriv ...`).
+    pub wrap: String,
 }
 
 impl Case {
@@ -168,6 +219,8 @@ impl Case {
             before: Vec::new(),
             nofile: None,
             squeeze: false,
+            files: Vec::new(),
+            wrap: String::new(),
         }
         .owner_setup()
     }
@@ -237,6 +290,18 @@ impl Case {
         self
     }
 
+    /// Run the program under `cmd` (words, unquoted).
+    pub fn wrap(mut self, cmd: &str) -> Case {
+        self.wrap = format!("{cmd} ");
+        self
+    }
+
+    /// A file at `T/path` (`@T@/path` in the sandbox).
+    pub fn file(mut self, path: &str, contents: &[u8]) -> Case {
+        self.files.push((path.to_string(), contents.to_vec()));
+        self
+    }
+
     pub fn env(mut self, kv: &str) -> Case {
         self.env.push(kv.to_string());
         self
@@ -266,6 +331,18 @@ pub struct Outcome {
     pub state: String,
     pub run: String,
     pub kernel: String,
+    /// What the key shim logged (`T/out/keylog`).
+    pub keylog: String,
+}
+
+/// One implementation's side of a case: its binaries (paths under `T/bin`), and what
+/// it adds to the environment and the setup.
+#[derive(Debug, Clone)]
+pub struct Impl {
+    pub label: &'static str,
+    pub bins: Vec<(String, PathBuf)>,
+    pub env: Vec<String>,
+    pub setup: Vec<String>,
 }
 
 fn cstr(s: impl AsRef<[u8]>) -> CString {
@@ -437,10 +514,11 @@ fn q(s: &str) -> String {
 }
 
 /// The pid-1 script.
-fn script(case: &Case, r: &Path) -> String {
+fn script(case: &Case, imp: &Impl, r: &Path) -> String {
+    let at_t = |a: &String| a.replace("@T@", r.to_str().unwrap());
     let r = r.display();
-    let args: Vec<String> = case.args.iter().map(|a| q(a)).collect();
-    let env: Vec<String> = case.env.iter().map(|a| q(a)).collect();
+    let args: Vec<String> = case.args.iter().map(|a| q(&at_t(a))).collect();
+    let env: Vec<String> = case.env.iter().chain(&imp.env).map(|a| q(&at_t(a))).collect();
     let mut s = format!(
         r#"set -u
 R={r}
@@ -474,7 +552,7 @@ mount --bind "$R/nfs" /var/lib/nfs || exit 96
 "#,
         );
     }
-    for l in &case.setup {
+    for l in case.setup.iter().chain(&imp.setup) {
         s.push_str(l);
         s.push('\n');
     }
@@ -524,6 +602,7 @@ chmod -R u+rwX "$R/nfs" 2>/dev/null
 exit 0
 "#,
         launch = launch
+            .replace("\"$R/bin/{prog}\"", &format!("{}\"$R/bin/{{prog}}\"", case.wrap))
             .replace(
                 "\"$R/bin/{prog}\"",
                 if std::env::var_os("NFSUTILS_STRACE").is_some() {
@@ -589,7 +668,8 @@ fn write_files(dir: &Path, files: &[(String, Vec<u8>)]) {
 }
 
 /// Run one implementation of the case's program.
-pub fn run(case: &Case, bins: &[(&str, PathBuf)], label: &str) -> Outcome {
+pub fn run(case: &Case, imp: &Impl) -> Outcome {
+    let label = imp.label;
     let base = workspace_dir().join("target/difftest").join(&case.name);
     let t = base.join(label);
     clean(&t);
@@ -599,13 +679,17 @@ pub fn run(case: &Case, bins: &[(&str, PathBuf)], label: &str) -> Outcome {
     // Hard links, not copies: a copy is open for writing for a moment, and a parallel
     // test's fork() in that moment makes exec fail with ETXTBSY.
     let link = |src: &Path, dst: &str| {
+        // A link to the file, not to a symlink to it.
+        let src = &src.canonicalize().unwrap();
         let d = t.join(dst);
         if std::fs::hard_link(src, &d).is_err() {
             std::fs::copy(src, &d).unwrap();
         }
     };
-    for (name, bin) in bins {
-        link(bin, &format!("bin/{name}"));
+    for (name, bin) in &imp.bins {
+        let dst = format!("bin/{name}");
+        std::fs::create_dir_all(t.join(&dst).parent().unwrap()).unwrap();
+        link(bin, &dst);
     }
     link(&probe_binary(), "bin/nsmprobe");
     link(&shim(), "bin/faketime.so");
@@ -615,6 +699,7 @@ pub fn run(case: &Case, bins: &[(&str, PathBuf)], label: &str) -> Outcome {
     std::fs::set_permissions(t.join("faketime"), std::fs::Permissions::from_mode(0o666)).unwrap();
     write_files(&t.join("etc"), &case.etc);
     write_files(&t.join("state"), &case.state);
+    write_files(&t, &case.files);
     let root = fixed_root();
     let mut probe: Vec<String> = case.peers.iter().map(|l| format!("peer {l}")).collect();
     if case.rpcbind {
@@ -634,21 +719,39 @@ pub fn run(case: &Case, bins: &[(&str, PathBuf)], label: &str) -> Outcome {
     let binds = vec![(path_c(&t), path_c(&root))];
     let devlog = t.join("devlog");
     let log = UnixDatagram::bind(&devlog).unwrap();
-    log.set_nonblocking(true).unwrap();
+    // Read as the program logs: a full socket would block its syslog() calls.
+    log.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match log.recv(&mut buf) {
+                    Ok(n) => got.push(buf[..n].to_vec()),
+                    Err(_) if stop.load(std::sync::atomic::Ordering::Relaxed) => break,
+                    Err(_) => {}
+                }
+            }
+            got
+        })
+    };
     let mut binds = binds;
     binds.push((path_c(&devlog), cstr("/dev/log")));
 
     let err = std::fs::File::create(t.join("out/sandbox")).unwrap();
     let null = std::fs::File::open("/dev/null").unwrap();
     use std::os::fd::AsRawFd;
-    let pid = spawn_in_sandbox(&binds, &script(case, &root), [null.as_raw_fd(), err.as_raw_fd(), err.as_raw_fd()]);
+    let pid = spawn_in_sandbox(&binds, &script(case, imp, &root), [null.as_raw_fd(), err.as_raw_fd(), err.as_raw_fd()]);
     let st = wait(pid, Duration::from_secs(120));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let got = reader.join().unwrap();
     assert_eq!(st, "exit 0", "{}/{label}: sandbox {st}:\n{}", case.name, read(&t, "out/sandbox"));
 
     let mut syslog = Vec::new();
-    let mut buf = vec![0u8; 65536];
-    while let Ok(n) = log.recv(&mut buf) {
-        let m = render_syslog(&buf[..n]);
+    for msg in got {
+        let m = render_syslog(&msg);
         // The sandbox's rpcbind is the same in both runs.
         if !m.contains("> rpcbind[") && !m.contains(">rpcbind[") {
             syslog.push(m);
@@ -672,6 +775,7 @@ pub fn run(case: &Case, bins: &[(&str, PathBuf)], label: &str) -> Outcome {
             read(&t, "out/nlm_tcpport"),
             read(&t, "out/nlm_udpport")
         ),
+        keylog: fix(read(&t, "out/keylog")),
     }
 }
 
@@ -696,16 +800,54 @@ fn squeeze(s: &str) -> String {
 
 /// Run both and compare; returns the C outcome.
 pub fn check(case: Case) -> Outcome {
-    let (c_bins, r_bins) = match case.prog.as_str() {
-        "sm-notify" => (vec![("sm-notify", reference_binary("sm-notify"))], vec![("sm-notify", rust_sm_notify())]),
-        "rpc.statd" => (
-            vec![("rpc.statd", reference_binary("statd")), ("sm-notify", reference_binary("sm-notify"))],
-            vec![("rpc.statd", rust_statd()), ("sm-notify", rust_sm_notify())],
+    let b = |n: &str, p: PathBuf| (n.to_string(), p);
+    let imp = |label, bins| Impl { label, bins, env: Vec::new(), setup: Vec::new() };
+    let (c, r) = match case.prog.as_str() {
+        "sm-notify" => (
+            imp("c", vec![b("sm-notify", reference_binary("sm-notify"))]),
+            imp("r", vec![b("sm-notify", rust_sm_notify())]),
         ),
+        "rpc.statd" => (
+            imp("c", vec![b("rpc.statd", reference_binary("statd")), b("sm-notify", reference_binary("sm-notify"))]),
+            imp("r", vec![b("rpc.statd", rust_statd()), b("sm-notify", rust_sm_notify())]),
+        ),
+        "nfsidmap" | "idmaptest" => {
+            // The C library from the reference tree, with its plugins where it looks
+            // for them; the key shim for both.
+            let (cbin, rbin) = if case.prog == "nfsidmap" {
+                (reference_file("utils/nfsidmap/.libs/nfsidmap"), rust_nfsidmap())
+            } else {
+                (c_idmaptest(), rust_idmaptest())
+            };
+            let keys = b("fakekeys.so", keys_shim());
+            let env = |extra: &[&str]| {
+                let mut e = vec![
+                    "LD_PRELOAD=@T@/bin/faketime.so @T@/bin/fakekeys.so".to_string(),
+                    "TEST_KEYS=@T@/keys.state".to_string(),
+                    "TEST_KEYLOG=@T@/out/keylog".to_string(),
+                ];
+                e.extend(extra.iter().map(|s| s.to_string()));
+                e
+            };
+            let plugins = reference_file("support/nfsidmap/.libs");
+            let mut c = imp(
+                "c",
+                vec![
+                    b(&case.prog, cbin),
+                    keys.clone(),
+                    b("lib/libnfsidmap.so.1", reference_file("support/nfsidmap/.libs/libnfsidmap.so.1")),
+                ],
+            );
+            c.env = env(&["LD_LIBRARY_PATH=@T@/bin/lib"]);
+            c.setup = vec![format!("mount --bind {} /usr/lib64/libnfsidmap", q(plugins.to_str().unwrap()))];
+            let mut r = imp("r", vec![b(&case.prog, rbin), keys]);
+            r.env = env(&[]);
+            (c, r)
+        }
         p => panic!("unknown program {p}"),
     };
-    let c = run(&case, &c_bins, "c");
-    let r = run(&case, &r_bins, "r");
+    let c = run(&case, &c);
+    let r = run(&case, &r);
     if std::env::var_os("NFSUTILS_DIFF_SHOW").is_some() {
         eprintln!("=== {} ===\n{c:#?}", case.name);
     }
@@ -731,6 +873,7 @@ fn compare(name: &str, c: &Outcome, r: &Outcome) {
         field!(state);
         field!(run);
         field!(kernel);
+        field!(keylog);
         panic!("{msg}");
     }
 }

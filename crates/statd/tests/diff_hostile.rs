@@ -64,7 +64,9 @@ fn truncated_mon_udp() {
 #[test]
 fn truncated_mon_tcp() {
     let full = mon_args("peer-b", "client", PRIV2);
-    let mut c = fg("truncated_mon_tcp").probe(&sm_mon("full", "peer-a", "client"));
+    // How many times the loop wakes for a connection (its data and its close arriving
+    // together or apart) is timing: the "Waiting" lines are collapsed.
+    let mut c = fg("truncated_mon_tcp").squeeze().probe(&sm_mon("full", "peer-a", "client"));
     for cut in [0, 4, 8, 12, 20, 28, 36, 48] {
         c = c.probe(&format!("call cut{cut} tcp 127.0.0.1 800 2 {}", &full[..cut * 2]));
     }
@@ -254,7 +256,11 @@ fn odd_bytes_in_names() {
         c = c.probe(&format!("call stat{i} udp 127.0.0.1 800 1 {}", xb(n)));
     }
     for (i, n) in [&b"../../etc/passwd"[..], b"%n%s%x", b"a\0b", b"\xff\x01x", &[b'z'; 1000][..]].iter().enumerate() {
-        let args = format!("{}{}{PRIV}", xs("peer-a"), format_args!("{}{}{}{}", xb(n), xi(LOCKD.0.into()), xi(LOCKD.1.into()), xi(LOCKD.2.into())));
+        let args = format!(
+            "{}{}{PRIV}",
+            xs("peer-a"),
+            format_args!("{}{}{}{}", xb(n), xi(LOCKD.0.into()), xi(LOCKD.1.into()), xi(LOCKD.2.into()))
+        );
         c = c.probe(&format!("call my{i} udp 127.0.0.1 800 2 {args}"));
     }
     check(stop(c.probe(&sm_unmon_all("unmon_all", "127.0.0.1", "client"))));

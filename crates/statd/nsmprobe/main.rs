@@ -12,6 +12,14 @@
 //!   - `hex:HEX` - these bytes, with `XID` standing for the call's xid;
 //!   - `ACTION@ADDR` - ACTION's answer, sent from a new socket on ADDR (any port): a
 //!     spoofed reply.
+//! - `peer NAME ADDR PORT dns` - a fake DNS server at ADDR:PORT (UDP), answering by the
+//!   `dns` rules; each query is logged as `NAME query QNAME QTYPE` (the ids are random).
+//! - `dns QNAME QTYPE ANSWER` - the first rule matching a query's name (any case) and
+//!   type (a number, or A, CNAME, TXT, AAAA, `*` for any) answers it; with none, the
+//!   answer is NXDOMAIN. ANSWER is `nx`, `servfail`, `refused`, `nodata`, `drop` (none),
+//!   `raw:HEX` (the whole message after the id), or resource records joined by `+`, each
+//!   for the query's name: `txt:STR` (one string; `%HH` is a byte), `txtraw:HEX` (the
+//!   record's data), `a:ADDR` or `cname:NAME`.
 //! - `ready FIFO` - write "ready" to FIFO (the test script waits on it).
 //! - `serve STOPFILE` - answer until STOPFILE exists, then print the log: one
 //!   `NAME got HEX from ADDR PORT` line per datagram, in arrival order (a port from
@@ -70,6 +78,126 @@ struct Peer {
     sock: UdpSocket,
     actions: Vec<String>,
     count: usize,
+}
+
+std::thread_local! {
+    /// The `dns` rules: (name, type or None for any, answer).
+    static DNS_RULES: std::cell::RefCell<Vec<(String, Option<u16>, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn dns_type(t: &str) -> Option<u16> {
+    match t {
+        "*" => None,
+        "A" => Some(1),
+        "CNAME" => Some(5),
+        "TXT" => Some(16),
+        "AAAA" => Some(28),
+        n => Some(n.parse().unwrap()),
+    }
+}
+
+/// A query's name (dotted, as sent) and type, and where its question ends.
+fn dns_question(q: &[u8]) -> Option<(String, u16, usize)> {
+    let mut i = 12;
+    let mut labels = Vec::new();
+    loop {
+        let l = *q.get(i)? as usize;
+        i += 1;
+        if l == 0 {
+            break;
+        }
+        labels.push(String::from_utf8_lossy(q.get(i..i + l)?).to_string());
+        i += l;
+    }
+    let ty = u16::from_be_bytes([*q.get(i)?, *q.get(i + 1)?]);
+    Some((labels.join("."), ty, i + 4))
+}
+
+fn dns_name(n: &str) -> Vec<u8> {
+    let mut v = Vec::new();
+    for l in n.split('.').filter(|l| !l.is_empty()) {
+        v.push(l.len() as u8);
+        v.extend(l.as_bytes());
+    }
+    v.push(0);
+    v
+}
+
+/// `%HH` escapes.
+fn unescape(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut v = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            v.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+            i += 3;
+        } else {
+            v.push(b[i]);
+            i += 1;
+        }
+    }
+    v
+}
+
+/// The answer to DNS query `q`, by the rules (logged as a query of `name`).
+fn dns_answer(peer: &str, q: &[u8], log: &mut Vec<String>) -> Option<Vec<u8>> {
+    let Some((qname, qtype, qend)) = dns_question(q) else {
+        log.push(format!("{peer} bad-query {}", hex(q)));
+        return None;
+    };
+    log.push(format!("{peer} query {qname} {qtype}"));
+    let rule = DNS_RULES.with(|r| {
+        r.borrow()
+            .iter()
+            .find(|(n, t, _)| n.eq_ignore_ascii_case(&qname) && t.is_none_or(|t| t == qtype))
+            .map(|x| x.2.clone())
+    });
+    let answer = rule.unwrap_or_else(|| "nx".to_string());
+    let mut m = q[..2].to_vec();
+    let head = |rcode: u16, an: u16| {
+        let mut h = (0x8180u16 | rcode).to_be_bytes().to_vec();
+        h.extend(1u16.to_be_bytes());
+        h.extend(an.to_be_bytes());
+        h.extend([0, 0, 0, 0]);
+        h.extend(&q[12..qend]);
+        h
+    };
+    match answer.as_str() {
+        "drop" => return None,
+        "nx" => m.extend(head(3, 0)),
+        "servfail" => m.extend(head(2, 0)),
+        "refused" => m.extend(head(5, 0)),
+        "nodata" => m.extend(head(0, 0)),
+        a if a.starts_with("raw:") => m.extend(unhex(&a[4..])),
+        a => {
+            let rrs: Vec<&str> = a.split('+').collect();
+            m.extend(head(0, rrs.len() as u16));
+            for rr in rrs {
+                let (kind, arg) = rr.split_once(':').unwrap_or((rr, ""));
+                let (ty, data) = match kind {
+                    "txt" => {
+                        let t = unescape(arg);
+                        let mut d = vec![t.len() as u8];
+                        d.extend(t);
+                        (16u16, d)
+                    }
+                    "txtraw" => (16, unhex(arg)),
+                    "a" => (1, arg.parse::<std::net::Ipv4Addr>().unwrap().octets().to_vec()),
+                    "cname" => (5, dns_name(arg)),
+                    _ => panic!("unknown dns record {rr}"),
+                };
+                m.extend([0xc0, 0x0c]);
+                m.extend(ty.to_be_bytes());
+                m.extend(1u16.to_be_bytes());
+                m.extend(60u32.to_be_bytes());
+                m.extend((data.len() as u16).to_be_bytes());
+                m.extend(data);
+            }
+        }
+    }
+    Some(m)
 }
 
 fn hex(b: &[u8]) -> String {
@@ -192,6 +320,12 @@ fn pump(peers: &mut [Peer], log: &mut Vec<String>) -> bool {
     got.sort_by_key(|g| g.0);
     for (_, i, msg, from) in got {
         let p = &mut peers[i];
+        if p.actions[0] == "dns" {
+            if let Some(r) = dns_answer(&p.name, &msg, log) {
+                let _ = p.sock.send_to(&r, from);
+            }
+            continue;
+        }
         // An ephemeral source port is the kernel's random pick.
         let port = if from.port() >= 32768 { "eph".to_string() } else { from.port().to_string() };
         log.push(format!("{} got {} from {} {port}", p.name, hex(&msg), from.ip()));
@@ -839,6 +973,10 @@ fn main() {
                     }
                     Err(e) => log.push(format!("{} bind-failed {}", f[1], e.raw_os_error().unwrap_or(0))),
                 }
+            }
+            Some("dns") => {
+                let ans = f[3..].join(" ");
+                DNS_RULES.with(|r| r.borrow_mut().push((f[1].to_string(), dns_type(f[2]), ans)));
             }
             Some("ready") => {
                 let mut fifo = std::fs::OpenOptions::new().write(true).open(f[1]).unwrap();

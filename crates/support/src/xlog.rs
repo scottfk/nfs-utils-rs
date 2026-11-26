@@ -4,7 +4,7 @@
 //! The state lives in atomics because, as in C, the signal handlers log straight away.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::Relaxed};
 
 use crate::sys;
 
@@ -26,6 +26,19 @@ static LOG_SYSLOG: AtomicI32 = AtomicI32::new(1);
 static LOGGING: AtomicI32 = AtomicI32::new(0);
 static LOGMASK: AtomicI32 = AtomicI32::new(0);
 static LOG_NAME: OnceLock<Vec<u8>> = OnceLock::new();
+/// Set while code runs that, in C, has its own copy of `xlog.c` (libnfsidmap and its
+/// plugins each link `libnfsconf` with hidden symbols): that copy is never opened or
+/// configured, so it logs with an empty name, to both stderr and syslog, and no debug
+/// facilities.
+static IN_COPY: AtomicBool = AtomicBool::new(false);
+
+/// Run `f` as code with its own, never configured, copy of `xlog.c`.
+pub fn in_library_copy<T>(f: impl FnOnce() -> T) -> T {
+    let was = IN_COPY.swap(true, Relaxed);
+    let r = f();
+    IN_COPY.store(was, Relaxed);
+    r
+}
 
 /// `debugnames[]`.
 const DEBUGNAMES: &[(&[u8], i32)] = &[
@@ -130,12 +143,14 @@ pub fn xlog_enabled(fac: i32) -> bool {
 
 /// `xlog_backend()`: `msg` is the formatted message (`%m` already expanded).
 pub fn xlog(kind: i32, msg: &[u8]) {
-    if (kind & L_ALL) == 0 && !(LOGGING.load(Relaxed) != 0 && (kind & LOGMASK.load(Relaxed)) != 0) {
+    let copy = IN_COPY.load(Relaxed);
+    let (logging, logmask) = if copy { (0, 0) } else { (LOGGING.load(Relaxed), LOGMASK.load(Relaxed)) };
+    if (kind & L_ALL) == 0 && !(logging != 0 && (kind & logmask) != 0) {
         return;
     }
-    let log_stderr = LOG_STDERR.load(Relaxed) != 0;
+    let log_stderr = copy || LOG_STDERR.load(Relaxed) != 0;
     if log_stderr {
-        let name: &[u8] = LOG_NAME.get().map_or(b"", |v| v);
+        let name: &[u8] = if copy { b"" } else { LOG_NAME.get().map_or(b"", |v| v) };
         // fprintf(stderr, "%s: ", log_name); vfprintf(stderr, ...); fprintf(stderr, "\n").
         let mut head = name.to_vec();
         head.extend_from_slice(b": ");
@@ -143,7 +158,7 @@ pub fn xlog(kind: i32, msg: &[u8]) {
         sys::stderr(c_str(msg));
         sys::stderr(b"\n");
     }
-    if LOG_SYSLOG.load(Relaxed) != 0 {
+    if copy || LOG_SYSLOG.load(Relaxed) != 0 {
         let pri = match kind {
             L_FATAL | L_ERROR => Some(libc::LOG_ERR),
             L_WARNING => Some(libc::LOG_WARNING),
@@ -163,6 +178,14 @@ pub fn xlog(kind: i32, msg: &[u8]) {
 /// `xlog_warn()`.
 pub fn xlog_warn(msg: &[u8]) {
     xlog(L_WARNING, msg);
+}
+
+/// `xlog_errno()`: `errno = err`, then logs (`%m` in `msg` already expanded from
+/// `err`) and exits 1.
+pub fn xlog_errno(err: i32, msg: &[u8]) -> ! {
+    sys::set_errno(err);
+    xlog(L_FATAL, msg);
+    sys::exit(1);
 }
 
 /// `xlog_err()`: logs and exits 1.

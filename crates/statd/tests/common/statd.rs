@@ -88,4 +88,3 @@ pub fn sm_notify(name: &str, src: &str, mon_name: &str, state: i64) -> String {
 pub fn mon_record(mon_name: &str, my_name: &str) -> String {
     format!("0100007f 000186b5 00000004 00000010 {} {mon_name} {my_name}", PRIV.to_uppercase())
 }
-
