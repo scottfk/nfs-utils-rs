@@ -29,13 +29,16 @@ GSS daemons, ...) is out of scope and stays C.
 
 ## Status
 
-Phases 1 to 5 are done. `sm-notify` (PR #2) and `rpc.statd` (PR #3) are ported and
-merged, with the shared support code under them, phase 3 (PR #4) put both through
-hostile input, and phase 4 (PR #5) ported `libnfsidmap`, with its three methods built
-in, and `nfsidmap`. Phase 5 (branch `phase5-idmapd`, PR #6) ports `rpc.idmapd`, with
-the parts of libevent it uses. They give the same results as C in all 60 sm-notify, 74
-statd, 27 hostile-input, 41 libnfsidmap, 59 nfsidmap and 59 rpc.idmapd differential
-cases. Next: phase 6 (packaging, and the rehearsal on the test VM).
+All six phases are done. `sm-notify` (PR #2) and `rpc.statd` (PR #3) are ported, with
+the shared support code under them, phase 3 (PR #4) put both through hostile input,
+phase 4 (PR #5) ported `libnfsidmap`, with its three methods built in, and `nfsidmap`,
+and phase 5 (PR #6) `rpc.idmapd`, with the parts of libevent it uses. They give the
+same results as C in all 60 sm-notify, 74 statd, 27 hostile-input, 41 libnfsidmap, 59
+nfsidmap and 59 rpc.idmapd differential cases. Phase 6 (branch `phase6-packaging`, PR
+#7) adds the ebuild, `net-fs/nfs-utils-2.8.5_p9999`, rehearsed on two test VMs (an NFS
+server and a client) against the C build: the same results in every step, lock
+recovery after a server crash and after a client crash included. Installing it on
+hydra is scottfk's call.
 
 Phase 1, groundwork and `sm-notify`:
 
@@ -195,6 +198,46 @@ directory removed, `SIGUSR1` reading descriptor 10 in the layouts where that blo
 and where it doesn't, forty clients), with the program's descriptors compared after
 each step. Ten mutants (the first scan not run at once, the signal number not passed as the descriptor, an escape moving on three bytes, the room check for an escape, the NUL check on the name itself, a 30-byte client id, both nfsd channels always opened, `LOOKUPFAIL` left alone, libevent's warning text, and the expiry written for any non-zero value) each fail a case.
 
+Phase 6, packaging:
+
+- [contrib/gentoo/net-fs/nfs-utils/](contrib/gentoo/net-fs/nfs-utils/):
+  `nfs-utils-2.8.5_p9999.ebuild` is Gentoo's `nfs-utils-2.8.5-r1` with a cargo build of
+  nfs-utils-rs (live from git, with rpcbind-rs's `tirpc` from its pinned commit) and
+  the four programs installed over the C ones. It installs exactly the C package's
+  files, plus this README and QUIRKS.md under `/usr/share/doc`. To use it, copy it into
+  a local repository and add `=net-fs/nfs-utils-2.8.5_p9999 **` to
+  `package.accept_keywords` and `>net-fs/nfs-utils-2.8.5_p9999` to `package.mask`.
+- [tools/vm-nfscheck.sh](tools/vm-nfscheck.sh): the rehearsal, run as root in two
+  VMs: `nfs-a`, the server, and `nfs-b`, a linked clone, the client, on a network of
+  their own. Each step's output is kept, normalized, for comparison:
+  - on `nfs-a` over loopback, NFSv3 locks (statd monitoring them), and NFSv4.2 with the
+    kernel's id mapping turned on (`nfs4_disable_idmapping=N` on both sides), so names
+    go through `rpc.idmapd` (for nfsd) and `nfsidmap` (for the client's keys): files
+    owned by known and unknown users and groups, `chown` and `chgrp` by name and by
+    number, as root and as a user, `nfsidmap -l` and `-c`, and `rpc.idmapd` and
+    `rpc.statd` restarted or sent `SIGHUP`;
+  - from `nfs-b`, a v3 lock held on `nfs-a`, and names over v4.2 between the two;
+  - `nfs-a` crashed (a VM reset): at boot its sm-notify tells `nfs-b`, whose statd calls
+    its lockd back, and the lock is reclaimed in the grace period;
+  - `nfs-b` crashed: at boot its sm-notify tells `nfs-a`, whose statd tells its lockd,
+    and the lock is released;
+  - statd and sm-notify log at `debug = all` throughout, and their log lines and the
+    monitor records are compared.
+
+  The C build (`net-fs/nfs-utils-2.8.5`) and the Rust one gave the same results in
+  every step; the differences are which programs ran, the NSM state numbers (which go
+  up with every boot) and random ports. A third pass, with rpcbind-rs
+  (`net-nds/rpcbind-1.2.8_p9999`) under the Rust programs, as on hydra, gave the same
+  results again. Then both VMs went back to C from a
+  quickpkg made before (`FEATURES=-binpkg-request-signature`, as the guests ask for
+  signed binary packages), and `rpc.statd` and `rpc.idmapd` were restarted.
+- Found on the way, not bugs in either build: a clean reboot of the server releases
+  the clients' locks rather than having them reclaimed (stopping nfsd makes the
+  kernel's lockd unmonitor every client, so sm-notify has no one to tell), which is why
+  the rehearsal crashes the server; and sm-notify can only reach a peer at boot if the
+  network to it is up before the NFS services (in the rehearsal a small OpenRC
+  service sets the address `before rpcbind`).
+
 The plan and its status live in the [roadmap](#roadmap) below, which is updated as each
 step lands.
 
@@ -205,7 +248,7 @@ against the system libtirpc 1.3.7, libevent 2.1 and keyutils:
 - USE="-caps -junction -kerberos -ldap +libmount -nfsdctl +nfsv3 +nfsv4 -sasl -selinux
   -tcpd +uuid": no capabilities, no TCP wrappers, no LDAP or GUMS id mapping, no GSS;
 - state directory `/var/lib/nfs`, id-mapping plugins in `/usr/lib64/libnfsidmap`;
-- `/sbin/rpc.statd`, `/sbin/sm-notify`, `/usr/sbin/rpc.idmapd`, `/usr/sbin/nfsidmap`,
+- `/sbin/rpc.statd`, `/usr/sbin/sm-notify`, `/usr/sbin/rpc.idmapd`, `/usr/sbin/nfsidmap`,
   `libnfsidmap.so.1` and its `nsswitch`, `static` and `regex` plugins.
 
 The reference build imports exactly the same libc, libtirpc, libevent and keyutils
@@ -231,8 +274,8 @@ Upstream's code for these programs is about 9,000 lines of C, plus the parts of
 | `crates/idmapd/` | `utils/nfsidmap/nfsidmap.c` (`src/nfsidmap.rs`) and `utils/idmapd/idmapd.c` (`src/idmapd/`: `main.rs`, and `ev.rs` for libevent); the binary is built as `idmapd` and installed as `rpc.idmapd` |
 | `crates/statd/tests/` | differential tests and the harness (adapted from rpcbind-rs); `nsmprobe/` is the fake-peer tool |
 | `crates/idmapd/tests/` | the id-mapping differential tests (with the harness from `crates/statd/tests/`), the fake keyring (`shim/fakekeys.c`) and kernel channels (`shim/fakepipes.c`), and the C library driver (`tools/idmaptest.c`; `tools/idmaptest.rs` is the Rust one) |
-| `contrib/gentoo/` | packaging |
-| `tools/` | the reference build, and the checks run on the test VM |
+| `contrib/gentoo/` | the ebuild (`net-fs/nfs-utils-2.8.5_p9999`, with Gentoo's `files/`) |
+| `tools/` | the reference build, and the checks run on the test VMs (`vm-nfscheck.sh`) |
 
 The `tirpc` crate comes from rpcbind-rs as a git dependency pinned to a commit. What
 `rpc.statd` needs that rpcbind didn't (`svc_create()`-style registration with rpcbind,
@@ -331,11 +374,11 @@ else blocked somewhere, which is logged. A file is bound over
    on a client, and faked), `-S`/`-C`, `-p`, `-c`, `-U`/`-G`, `-v`, `-f`, the
    `[General]` and `[Mapping]` settings, `SIGUSR1`/`SIGUSR2`/`SIGHUP` rescans, and the
    libevent loop's behavior, against fake pipefs trees.
-6. **Packaging (planned):** a Gentoo ebuild and a way to swap these programs in while
-   the rest of nfs-utils stays C (nfs-utils is one package, so how to do this is decided
-   in this phase), rehearsed on the test VM with rpcbind-rs, a real NFS server and client,
-   NFSv3 locks across a server reboot (statd and sm-notify doing lock recovery) and
-   NFSv4 id mapping, then rolled back through a binary package of the C build.
+6. **Packaging (done, PR #7):** `net-fs/nfs-utils-2.8.5_p9999`, Gentoo's ebuild with
+   these programs swapped in while the rest of nfs-utils stays C, rehearsed on two test
+   VMs with a real NFS server and client: NFSv3 locks across a server crash and a client
+   crash (statd and sm-notify doing lock recovery), NFSv4 id mapping, with C and with
+   rpcbind-rs, then rolled back through a binary package of the C build.
 
 Open questions, to settle in the phase where they come up:
 
@@ -344,8 +387,16 @@ Open questions, to settle in the phase where they come up:
   `nfsidmap` link it. A `Method` naming another plugin (`umich_ldap`, `gums`, a
   third-party `.so`) fails the way C fails to `dlopen()` a missing plugin (see
   QUIRKS.md).
-- Phase 6's packaging approach (a trimmed nfs-utils ebuild in localrepo that leaves these
-  programs to `nfs-utils-rs`, or something else).
+- ~~Phase 6's packaging approach.~~ Settled in phase 6: one ebuild,
+  `net-fs/nfs-utils-2.8.5_p9999` ([contrib/gentoo/](contrib/gentoo/net-fs/nfs-utils/)),
+  which is Gentoo's `nfs-utils-2.8.5-r1` unchanged (the same C build, flags, files and
+  init scripts) plus a cargo build of nfs-utils-rs from git, whose four programs are
+  installed over the C ones where C put them. The rest of nfs-utils stays C, and so
+  does `libnfsidmap.so.1` with its plugins, for anything else that links it. Two
+  packages can't own the same files, and splitting nfs-utils would mean a second,
+  trimmed copy of its ebuild to maintain; this way going back is one `emerge` of the
+  C release (or its binary package). `REQUIRED_USE` rules out the flags the port
+  doesn't cover (`caps`, `kerberos`, `ldap`, `tcpd`).
 
 Not planned unless needed: the build options hydra doesn't use (capabilities, TCP
 wrappers, LDAP and GUMS mapping, GSS principals beyond what `libnfsidmap`'s API passes
