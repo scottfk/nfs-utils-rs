@@ -594,6 +594,33 @@ impl Conf {
         }
         Some(out)
     }
+
+    /// `conf_get_str_with_def()`.
+    pub fn get_str_with_def(&self, section: &[u8], tag: &[u8], def: &[u8]) -> Vec<u8> {
+        self.get_section(section, None, tag).unwrap_or_else(|| def.to_vec())
+    }
+
+    /// `conf_get_tag_list()`: the tags of every binding in `section` (any subsection
+    /// when `arg` is `None`), in the bucket's order, newest first. C never returns NULL
+    /// here but on a failed allocation.
+    pub fn get_tag_list(&self, section: &[u8], arg: Option<&[u8]>) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for cb in &self.buckets[conf_hash(section)] {
+            if !sys::strcaseeq(section, &cb.section) {
+                continue;
+            }
+            if let Some(a) = arg {
+                // C compares against cb->arg even when it is NULL (and crashes); no
+                // caller passes an arg.
+                match &cb.arg {
+                    Some(x) if sys::strcaseeq(a, x) => {}
+                    _ => continue,
+                }
+            }
+            out.push(cb.tag.clone());
+        }
+        out
+    }
 }
 
 static CONF: Mutex<Option<Conf>> = Mutex::new(None);

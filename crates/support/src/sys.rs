@@ -530,6 +530,12 @@ impl Args {
         }
     }
 
+    /// `argv[from..]` as `getopt()` left the array (it moves the operands last).
+    pub fn rest(&self, from: usize) -> Vec<Vec<u8>> {
+        // SAFETY: every entry before the terminating NULL is one of our strings.
+        self.ptrs[..self.argc()].iter().skip(from).map(|&p| unsafe { CStr::from_ptr(p) }.to_bytes().to_vec()).collect()
+    }
+
     /// `optind`.
     pub fn optind(&self) -> usize {
         // SAFETY: getopt's global, read between calls.
@@ -993,4 +999,360 @@ pub fn getnameinfo_len(sa: &[u8], salen: usize, buflen: usize, flags: i32) -> Re
     }
     // SAFETY: getnameinfo NUL-terminates on success.
     Ok(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_bytes().to_vec())
+}
+
+/// `geteuid()`.
+pub fn geteuid() -> u32 {
+    // SAFETY: no preconditions.
+    unsafe { libc::geteuid() }
+}
+
+/// `toupper(c)` in the C locale.
+pub fn toupper(c: u8) -> u8 {
+    c.to_ascii_uppercase()
+}
+
+/// What the id-mapping code reads from a `struct passwd`.
+#[derive(Debug, Clone)]
+pub struct Passwd {
+    pub name: Vec<u8>,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// What it reads from a `struct group`.
+#[derive(Debug, Clone)]
+pub struct Group {
+    pub name: Vec<u8>,
+    pub gid: u32,
+}
+
+/// A `get*_r()` result: the return value, the entry when found, and `errno` right
+/// after the call (which some messages print).
+#[derive(Debug)]
+pub struct Lookup<T> {
+    pub ret: i32,
+    pub entry: Option<T>,
+    pub errno: i32,
+}
+
+/// `sysconf(_SC_GETPW_R_SIZE_MAX)`, or 16384 when it has no answer (`get_pwnam_buflen()`).
+pub fn getpw_r_size_max() -> usize {
+    // SAFETY: no memory is involved.
+    let n = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    if n == -1 { 16384 } else { n as usize }
+}
+
+/// `sysconf(_SC_GETGR_R_SIZE_MAX)`, or 16384 (`get_grnam_buflen()`).
+pub fn getgr_r_size_max() -> usize {
+    // SAFETY: no memory is involved.
+    let n = unsafe { libc::sysconf(libc::_SC_GETGR_R_SIZE_MAX) };
+    if n == -1 { 16384 } else { n as usize }
+}
+
+fn passwd_of(pw: *const libc::passwd) -> Option<Passwd> {
+    if pw.is_null() {
+        return None;
+    }
+    // SAFETY: a non-NULL result points at the caller's struct, its strings in the buffer.
+    unsafe {
+        Some(Passwd { name: CStr::from_ptr((*pw).pw_name).to_bytes().to_vec(), uid: (*pw).pw_uid, gid: (*pw).pw_gid })
+    }
+}
+
+fn group_of(gr: *const libc::group) -> Option<Group> {
+    if gr.is_null() {
+        return None;
+    }
+    // SAFETY: as for passwd_of().
+    unsafe { Some(Group { name: CStr::from_ptr((*gr).gr_name).to_bytes().to_vec(), gid: (*gr).gr_gid }) }
+}
+
+/// `getpwnam_r(name, &pwbuf, buf, buflen, &pw)`.
+pub fn getpwnam_r(name: &[u8], buflen: usize) -> Lookup<Passwd> {
+    let n = cstring(name);
+    let mut buf = vec![0 as c_char; buflen.max(1)];
+    // SAFETY: all-zero passwd is valid; buf has buflen bytes; pw is an out-pointer.
+    unsafe {
+        let mut pwbuf: libc::passwd = std::mem::zeroed();
+        let mut pw: *mut libc::passwd = std::ptr::null_mut();
+        let ret = libc::getpwnam_r(n.as_ptr(), &mut pwbuf, buf.as_mut_ptr(), buflen, &mut pw);
+        let errno = errno();
+        Lookup { ret, entry: passwd_of(pw), errno }
+    }
+}
+
+/// `getpwuid_r(uid, ...)`.
+pub fn getpwuid_r(uid: u32, buflen: usize) -> Lookup<Passwd> {
+    let mut buf = vec![0 as c_char; buflen.max(1)];
+    // SAFETY: as for getpwnam_r().
+    unsafe {
+        let mut pwbuf: libc::passwd = std::mem::zeroed();
+        let mut pw: *mut libc::passwd = std::ptr::null_mut();
+        let ret = libc::getpwuid_r(uid, &mut pwbuf, buf.as_mut_ptr(), buflen, &mut pw);
+        let errno = errno();
+        Lookup { ret, entry: passwd_of(pw), errno }
+    }
+}
+
+/// `getgrnam_r(name, ...)`.
+pub fn getgrnam_r(name: &[u8], buflen: usize) -> Lookup<Group> {
+    let n = cstring(name);
+    let mut buf = vec![0 as c_char; buflen.max(1)];
+    // SAFETY: as for getpwnam_r().
+    unsafe {
+        let mut grbuf: libc::group = std::mem::zeroed();
+        let mut gr: *mut libc::group = std::ptr::null_mut();
+        let ret = libc::getgrnam_r(n.as_ptr(), &mut grbuf, buf.as_mut_ptr(), buflen, &mut gr);
+        let errno = errno();
+        Lookup { ret, entry: group_of(gr), errno }
+    }
+}
+
+/// `getgrgid_r(gid, ...)`.
+pub fn getgrgid_r(gid: u32, buflen: usize) -> Lookup<Group> {
+    let mut buf = vec![0 as c_char; buflen.max(1)];
+    // SAFETY: as for getpwnam_r().
+    unsafe {
+        let mut grbuf: libc::group = std::mem::zeroed();
+        let mut gr: *mut libc::group = std::ptr::null_mut();
+        let ret = libc::getgrgid_r(gid, &mut grbuf, buf.as_mut_ptr(), buflen, &mut gr);
+        let errno = errno();
+        Lookup { ret, entry: group_of(gr), errno }
+    }
+}
+
+/// `getgrouplist(user, group, groups, &ngroups)` with room for `ngroups` (as passed
+/// in, at least 0): the return value, the groups it wrote, and `ngroups` after.
+pub fn getgrouplist(user: &[u8], group: u32, ngroups: i32) -> (i32, Vec<u32>, i32) {
+    let u = cstring(user);
+    let mut groups = vec![0 as libc::gid_t; ngroups.max(0) as usize + 1];
+    let mut n: c_int = ngroups;
+    // SAFETY: groups has room for ngroups entries (one more, so the pointer is valid).
+    let ret = unsafe { libc::getgrouplist(u.as_ptr(), group, groups.as_mut_ptr(), &mut n) };
+    let written = if ngroups <= 0 { 0 } else { (n.max(0) as usize).min(ngroups as usize) };
+    groups.truncate(written);
+    (ret, groups, n)
+}
+
+/// `gethostname(buf, len)` with a buffer of `len` bytes.
+pub fn gethostname(len: usize) -> Option<Vec<u8>> {
+    let mut buf = vec![0 as c_char; len];
+    // SAFETY: buf has len bytes.
+    if unsafe { libc::gethostname(buf.as_mut_ptr(), len) } == -1 {
+        return None;
+    }
+    // A name that just fits isn't NUL-terminated; C would read past it.
+    let end = buf.iter().position(|&c| c == 0).unwrap_or(len);
+    Some(buf[..end].iter().map(|&c| c as u8).collect())
+}
+
+unsafe extern "C" {
+    fn gethostbyname(name: *const c_char) -> *mut libc::hostent;
+    fn res_querydomain(
+        name: *const c_char,
+        domain: *const c_char,
+        class: c_int,
+        ty: c_int,
+        answer: *mut u8,
+        anslen: c_int,
+    ) -> c_int;
+    fn dn_skipname(comp_dn: *const u8, eom: *const u8) -> c_int;
+    fn dn_expand(msg: *const u8, eom: *const u8, comp_dn: *const u8, exp_dn: *mut c_char, length: c_int) -> c_int;
+    fn hstrerror(err: c_int) -> *const c_char;
+    fn __h_errno_location() -> *mut c_int;
+    fn warnx(fmt: *const c_char, ...);
+    fn sscanf(s: *const c_char, fmt: *const c_char, ...) -> c_int;
+}
+
+/// `gethostbyname(name)->h_name`.
+pub fn gethostbyname_name(name: &[u8]) -> Option<Vec<u8>> {
+    let n = cstring(name);
+    // SAFETY: the static result is copied at once.
+    unsafe {
+        let he = gethostbyname(n.as_ptr());
+        if he.is_null() { None } else { Some(CStr::from_ptr((*he).h_name).to_bytes().to_vec()) }
+    }
+}
+
+/// `res_querydomain(name, domain, class, type, buf, buf.len())`.
+pub fn res_querydomain_into(name: &[u8], domain: &[u8], class: i32, ty: i32, buf: &mut [u8], anslen: usize) -> i32 {
+    let (n, d) = (cstring(name), cstring(domain));
+    let anslen = anslen.min(buf.len());
+    // SAFETY: buf has at least anslen bytes.
+    unsafe { res_querydomain(n.as_ptr(), d.as_ptr(), class, ty, buf.as_mut_ptr(), anslen as c_int) }
+}
+
+/// `dn_skipname(buf + at, buf + eom)`. `at` may be past `eom` (but inside `buf`).
+pub fn dn_skipname_at(buf: &[u8], at: usize, eom: usize) -> i32 {
+    assert!(at <= buf.len() && eom <= buf.len());
+    // SAFETY: both pointers are inside buf; dn_skipname reads only below eom.
+    unsafe { dn_skipname(buf.as_ptr().add(at), buf.as_ptr().add(eom)) }
+}
+
+/// `dn_expand(buf, buf + eom, buf + at, out, length)`: the return value and the name.
+pub fn dn_expand_at(buf: &[u8], eom: usize, at: usize, length: usize) -> (i32, Vec<u8>) {
+    assert!(at <= buf.len() && eom <= buf.len());
+    let mut out = vec![0 as c_char; length + 1];
+    // SAFETY: pointers inside buf; out has length bytes and more.
+    let n = unsafe {
+        dn_expand(buf.as_ptr(), buf.as_ptr().add(eom), buf.as_ptr().add(at), out.as_mut_ptr(), length as c_int)
+    };
+    // SAFETY: out is NUL-terminated (zeroed, one byte longer than length).
+    (n, unsafe { CStr::from_ptr(out.as_ptr()) }.to_bytes().to_vec())
+}
+
+/// `h_errno`.
+pub fn h_errno() -> i32 {
+    // SAFETY: this thread's h_errno.
+    unsafe { *__h_errno_location() }
+}
+
+/// `hstrerror(err)`.
+pub fn hstrerror_of(err: i32) -> Vec<u8> {
+    // SAFETY: hstrerror returns a static string.
+    unsafe { CStr::from_ptr(hstrerror(err)) }.to_bytes().to_vec()
+}
+
+/// `warnx("%s", msg)`: `progname: msg` on stderr.
+pub fn warnx_msg(msg: &[u8]) {
+    let m = cstring(msg);
+    // SAFETY: a constant format with one string argument.
+    unsafe { warnx(c"%s".as_ptr(), m.as_ptr()) };
+}
+
+/// `sscanf(line, "%x %*s %*u %*s %*x %*d %*d %s %n", &id, typebuf, &ndesc)`, as
+/// libkeyutils parses `/proc/keys`: (conversions, id, type, ndesc). The type buffer is
+/// bigger than libkeyutils' 40 bytes, which a longer type would overflow.
+pub fn scan_proc_keys(line: &[u8]) -> (i32, i32, Vec<u8>, i32) {
+    let l = cstring(line);
+    let mut id: c_int = 0;
+    let mut ty = vec![0 as c_char; line.len() + 1];
+    let mut ndesc: c_int = 0;
+    // SAFETY: the conversions write an int, a string no longer than the line, and an int.
+    let n = unsafe {
+        sscanf(
+            l.as_ptr(),
+            c"%x %*s %*u %*s %*x %*d %*d %s %n".as_ptr(),
+            &mut id as *mut c_int,
+            ty.as_mut_ptr(),
+            &mut ndesc as *mut c_int,
+        )
+    };
+    // SAFETY: ty is NUL-terminated (zeroed and longer than any token of the line).
+    let t = unsafe { CStr::from_ptr(ty.as_ptr()) }.to_bytes().to_vec();
+    (n, id, t, ndesc)
+}
+
+/// `sscanf(s, "%x", &v)`: the conversion count and the value (`prev` when nothing was
+/// converted, as the variable keeps its old value).
+pub fn scan_hex(s: &[u8], prev: u32) -> (i32, u32) {
+    let c = cstring(s);
+    let mut v: libc::c_uint = prev;
+    // SAFETY: one unsigned int conversion.
+    let n = unsafe { sscanf(c.as_ptr(), c"%x".as_ptr(), &mut v as *mut libc::c_uint) };
+    (n, v)
+}
+
+/// `fopen(path, "r")` then `fgets(buf, size, f)` until EOF: the pieces fgets returns
+/// (each at most `size - 1` bytes, ending at a newline when there is one), or `errno`.
+pub fn fgets_all(path: &[u8], size: usize) -> Result<Vec<Vec<u8>>, i32> {
+    let fd = open(path, libc::O_RDONLY, 0);
+    if fd < 0 {
+        return Err(errno());
+    }
+    let mut data = Vec::new();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let n = read(fd, &mut buf);
+        if n <= 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n as usize]);
+    }
+    close(fd);
+    let mut out = Vec::new();
+    let mut rest = &data[..];
+    while !rest.is_empty() {
+        let max = size - 1;
+        let end = match rest.iter().take(max).position(|&b| b == b'\n') {
+            Some(p) => p + 1,
+            None => rest.len().min(max),
+        };
+        out.push(rest[..end].to_vec());
+        rest = &rest[end..];
+    }
+    Ok(out)
+}
+
+/// What C does when it dereferences a NULL pointer: die of `SIGSEGV`.
+pub fn segfault() -> ! {
+    // SAFETY: raising a signal; with the default action the process dies.
+    unsafe {
+        libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+        libc::raise(libc::SIGSEGV);
+    }
+    _exit(139)
+}
+
+/// `syscall(SYS_keyctl, cmd, a2, a3, a4, a5)`, as libkeyutils makes it.
+pub fn keyctl(cmd: i32, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+    // SAFETY: the caller passes valid pointers for the commands that take them.
+    unsafe { libc::syscall(libc::SYS_keyctl, cmd as libc::c_long, a2, a3, a4, a5) }
+}
+
+/// `syscall(SYS_request_key, type, desc, callout, dest)`.
+pub fn request_key(ty: &[u8], desc: &[u8], callout: Option<&[u8]>, dest: i32) -> i32 {
+    let (t, d) = (cstring(ty), cstring(desc));
+    let c = callout.map(cstring);
+    let cp = c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+    // SAFETY: C strings (or NULL) that live across the call.
+    unsafe { libc::syscall(libc::SYS_request_key, t.as_ptr(), d.as_ptr(), cp, dest as libc::c_long) as i32 }
+}
+
+/// A compiled POSIX regular expression (glibc's `regcomp()`), freed on drop.
+#[derive(Debug)]
+pub struct Regex {
+    re: Box<libc::regex_t>,
+}
+
+/// `regcomp(&re, pattern, flags)`: the expression, or the error code.
+pub fn regcomp(pattern: &[u8], flags: i32) -> Result<Regex, i32> {
+    let p = cstring(pattern);
+    // SAFETY: an all-zero regex_t is what a static one starts as; regcomp fills it.
+    unsafe {
+        let mut re: Box<libc::regex_t> = Box::new(std::mem::zeroed());
+        let rc = libc::regcomp(&mut *re, p.as_ptr(), flags);
+        if rc != 0 { Err(rc) } else { Ok(Regex { re }) }
+    }
+}
+
+impl Regex {
+    /// `regexec(&re, s, nmatch, matches, 0)`: the result and the `(rm_so, rm_eo)` pairs.
+    pub fn exec(&self, s: &[u8], nmatch: usize) -> (i32, Vec<(i64, i64)>) {
+        let c = cstring(s);
+        let mut m = vec![libc::regmatch_t { rm_so: -1, rm_eo: -1 }; nmatch.max(1)];
+        // SAFETY: a compiled expression; m has nmatch entries (or none are asked for).
+        let rc = unsafe {
+            libc::regexec(
+                &*self.re,
+                c.as_ptr(),
+                nmatch,
+                if nmatch == 0 { std::ptr::null_mut() } else { m.as_mut_ptr() },
+                0,
+            )
+        };
+        (rc, m.iter().take(nmatch).map(|x| (x.rm_so as i64, x.rm_eo as i64)).collect())
+    }
+}
+
+// SAFETY: a compiled regex_t is plain heap data owned by this value; glibc's regexec()
+// locks it, so moving it to another thread is fine.
+unsafe impl Send for Regex {}
+
+impl Drop for Regex {
+    fn drop(&mut self) {
+        // SAFETY: compiled by regcomp and not freed before.
+        unsafe { libc::regfree(&mut *self.re) };
+    }
 }

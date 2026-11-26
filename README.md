@@ -29,11 +29,12 @@ GSS daemons, ...) is out of scope and stays C.
 
 ## Status
 
-Phases 1 to 3 are done: `sm-notify` (PR #2) and `rpc.statd` (PR #3) are ported and
-merged, with the shared support code under them, and phase 3 (branch `phase3-hostile`,
-PR #4) puts both through hostile input. They give the same results as C in all 60
-sm-notify, 74 statd and 27 hostile-input differential cases. Next: phase 4
-(libnfsidmap and nfsidmap).
+Phases 1 to 4 are done. `sm-notify` (PR #2) and `rpc.statd` (PR #3) are ported and
+merged, with the shared support code under them, and phase 3 (PR #4) put both through
+hostile input. Phase 4 (branch `phase4-idmap`, PR #5) ports `libnfsidmap`, with its
+three methods built in, and `nfsidmap`. They give the same results as C in all 60
+sm-notify, 74 statd, 27 hostile-input, 41 libnfsidmap and 59 nfsidmap differential
+cases. Next: phase 5 (`rpc.idmapd`).
 
 Phase 1, groundwork and `sm-notify`:
 
@@ -131,6 +132,38 @@ continuations, debug facilities). Five mutants that undo reproduced quirks are
 caught: list fields trimmed, the parser's NUL not left for the next line, ties in the
 notify list not broken by age, the name cut at its last dot, and `0x` not taken.
 
+Phase 4, `libnfsidmap` and `nfsidmap`:
+
+- `crates/nfsidmap` (`support/nfsidmap`): `libnfsidmap.c` (setup, the default domain
+  from `Domain` or else DNS: the host's name, then the `_nfsv4idmapdomain` TXT record
+  parsed as C parses it; loading the `Method` and `GSS-Methods` lists; the calls run
+  through the methods in order until one doesn't say `-ENOENT`; owners as numbers and
+  `nobody`), `nfsidmap_common.c` (`Local-Realms`, `No-Strip`, `Reformat-Group`), and
+  the `nsswitch`, `static` and `regex` methods, each with its own copy of the
+  configuration as C's plugins have. User and group lookups, `getgrouplist()`, the
+  resolver and POSIX regular expressions are glibc's, called directly. It is a Rust
+  library with no C ABI: on hydra only `rpc.idmapd` and `nfsidmap` link
+  `libnfsidmap.so.1`.
+- `nfsidmap.c`: answering `uid:`, `gid:`, `user:` and `group:` keys (with the clear and
+  retry when the keyring is full), `-t`, `-v`, `-c`, `-l`, `-u`/`-g`/`-r` and `-d`, and
+  libkeyutils' calls as it makes them, its `/proc/keys` search included.
+
+The libnfsidmap suite (41 cases) drives the library's calls through two small drivers,
+one over each library: the default domain (configured, from the host's name, from TXT
+records good, odd and malformed, before setup, too long), setup (twice, after
+`term`, a missing file, realms, `Nobody-User`/`Nobody-Group`), the method lists
+(unknown names, order, repeats, empty, GSS methods, a failed setup retried), and each
+method's mappings (`No-Strip` and `Reformat-Group`, name forms, buffer lengths, big
+entries, principals and group lists; `static` sections and environment values;
+`regex` prefixes and suffixes, and the settings that crash it), with the library's
+log at each level. The nfsidmap suite (59 cases) covers each key type, owners as
+numbers and `nobody`, names too long, bad key descriptions and argument counts,
+options and usage, not running as root, full keyrings, failed key calls, and `-c`,
+`-l`, `-u`/`-g`/`-r` and `-d` against fake keyrings. Seven mutants (the domain split
+at the first `@`, the method list not moving on, `0` taken for any owner, `ENFILE` not
+a full keyring, a TXT name not skipped, the whole regex match taken, the first static
+mapping taken) each fail a case.
+
 The plan and its status live in the [roadmap](#roadmap) below, which is updated as each
 step lands.
 
@@ -156,8 +189,8 @@ the kernel calls `nfsidmap` through request-key for NFSv4 id lookups.
 ## Layout
 
 Upstream's code for these programs is about 9,000 lines of C, plus the parts of
-`support/` they use. The port follows the files (the id-mapping crates and packaging
-are still to come):
+`support/` they use. The port follows the files (`rpc.idmapd` and packaging are still
+to come):
 
 | Path | What |
 |---|---|
@@ -165,8 +198,9 @@ are still to come):
 | `crates/support/src/sys.rs` | every libc call |
 | `crates/statd/` | `utils/statd`: `sm-notify` (`src/sm_notify.rs`) and `rpc.statd` (`src/statd/`: `statd.c` and `svc_run.c` in `main.rs`, `monitor.c` with `stat.c`, `simu.c` and `callback.c`, `notlist.c`, `rmtcall.c`, `hostname.c`); the binary is built as `statd` and installed as `rpc.statd` |
 | `crates/nfsidmap/` | `support/nfsidmap`: the library and its `nsswitch`, `static` and `regex` methods |
-| `crates/idmapd/` | `utils/idmapd/idmapd.c` and `utils/nfsidmap/nfsidmap.c` |
+| `crates/idmapd/` | `utils/nfsidmap/nfsidmap.c` (`src/nfsidmap.rs`), and `utils/idmapd/idmapd.c` in phase 5 |
 | `crates/statd/tests/` | differential tests and the harness (adapted from rpcbind-rs); `nsmprobe/` is the fake-peer tool |
+| `crates/idmapd/tests/` | the id-mapping differential tests (with the harness from `crates/statd/tests/`), the fake keyring (`shim/fakekeys.c`), and the C library driver (`tools/idmaptest.c`; `tools/idmaptest.rs` is the Rust one) |
 | `contrib/gentoo/` | packaging |
 | `tools/` | the reference build, and the checks run on the test VM |
 
@@ -182,7 +216,8 @@ make check
 ```
 
 This builds the C reference into `../nfs-utils` if it isn't there, then runs the unit
-tests and the differential suite ([crates/statd/tests/](crates/statd/tests/)). As in
+tests and the differential suites ([crates/statd/tests/](crates/statd/tests/) and
+[crates/idmapd/tests/](crates/idmapd/tests/)). As in
 rpcbind-rs, each case runs the C program and then the port in a private user, mount,
 network, pid and UTS namespace (ids mapped from your subordinate ranges, so there's a
 real root and `nobody` exists), with its own loopback, `/run`, `/var/lib/nfs` (with
@@ -212,8 +247,16 @@ in both runs) and the implementation's own sm-notify; the probe stands in for lo
 it's idle in `select()`, and dumps rpcbind's table. The clock's `select()` timeouts pass
 at once too. For the hostile-input cases the probe also holds TCP connections open
 (hundreds at once, half records, records split oddly), sends replies from other
-addresses, steps the clock, and counts statd's descriptors. For id mapping (phases 4 and 5) it will add a fake `rpc_pipefs` tree and
-the request-key interface.
+addresses, steps the clock, and counts statd's descriptors.
+
+For id mapping the sandbox has its own `passwd`, `group`, `hosts`, `nsswitch.conf`,
+`resolv.conf` (pointing at a fake DNS server in the probe, which logs every query) and
+`idmapd.conf`. The C runs load the reference `libnfsidmap.so.1` and have its plugins
+bound over `/usr/lib64/libnfsidmap` (which must exist on the host). Keys can't come
+from the kernel in a sandbox, so a second LD_PRELOAD shim (`crates/idmapd/tests/shim/`)
+answers libkeyutils' and the port's `keyctl()` and `request_key()` calls from a file of
+fake keys, with failures injected on request, and logs each call for comparison;
+`/proc/keys` is a file bound over it. Phase 5 will add a fake `rpc_pipefs` tree.
 
 ## Roadmap
 
@@ -235,7 +278,7 @@ the request-key interface.
 3. **Hostile input (done, PR #4):** malformed and truncated NSM calls, hostile `mon_name`s
    (path tricks, overlong, odd characters), `SM_NOTIFY` floods and spoofed peers, a full
    or read-only state directory, and connection floods on statd's TCP socket.
-4. **libnfsidmap and nfsidmap (planned):** `idmapd.conf` (`[General]`, `[Mapping]`,
+4. **libnfsidmap and nfsidmap (done, PR #5):** `idmapd.conf` (`[General]`, `[Mapping]`,
    `[Translation]`, `[Static]`, `[Regex]`), the default domain (from `Domain`, else DNS),
    the `nsswitch`, `static` and `regex` methods built in, `Local-Realms`, and the
    `nfsidmap` request-key helper (`-t`, `-c`, `-l`, `-r`, `-u`, `-g`, `-d`) with its
@@ -253,11 +296,11 @@ the request-key interface.
 
 Open questions, to settle in the phase where they come up:
 
-- Whether `libnfsidmap.so.1` also needs a C ABI. On hydra only `rpc.idmapd` and
-  `nfsidmap` link it, so the plan is a Rust library with the three methods built in.
-  A `Method` naming another plugin (`umich_ldap`, `gums`, a third-party `.so`) would then
-  fail the way C fails to `dlopen()` a missing plugin, and that difference is listed in
-  QUIRKS.md.
+- ~~Whether `libnfsidmap.so.1` also needs a C ABI.~~ Settled in phase 4: no. It is a
+  Rust library with the three methods built in, since on hydra only `rpc.idmapd` and
+  `nfsidmap` link it. A `Method` naming another plugin (`umich_ldap`, `gums`, a
+  third-party `.so`) fails the way C fails to `dlopen()` a missing plugin (see
+  QUIRKS.md).
 - Phase 6's packaging approach (a trimmed nfs-utils ebuild in localrepo that leaves these
   programs to `nfs-utils-rs`, or something else).
 

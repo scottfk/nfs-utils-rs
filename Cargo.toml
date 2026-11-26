@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/support", "crates/statd"]
+members = ["crates/support", "crates/statd", "crates/nfsidmap", "crates/idmapd"]
 
 [workspace.package]
 version = "0.1.0"
