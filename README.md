@@ -34,11 +34,12 @@ the shared support code under them, phase 3 (PR #4) put both through hostile inp
 phase 4 (PR #5) ported `libnfsidmap`, with its three methods built in, and `nfsidmap`,
 and phase 5 (PR #6) `rpc.idmapd`, with the parts of libevent it uses. They give the
 same results as C in all 60 sm-notify, 74 statd, 27 hostile-input, 41 libnfsidmap, 59
-nfsidmap and 59 rpc.idmapd differential cases. Phase 6 (branch `phase6-packaging`, PR
-#7) adds the ebuild, `net-fs/nfs-utils-2.8.5_p9999`, rehearsed on two test VMs (an NFS
-server and a client) against the C build: the same results in every step, lock
-recovery after a server crash and after a client crash included. Installing it on
-hydra is scottfk's call.
+nfsidmap and 59 rpc.idmapd differential cases. Phase 6 (PR #7) added the ebuild,
+`net-fs/nfs-utils-2.8.5_p9999`, rehearsed on two test VMs (an NFS server and a client)
+against the C build: the same results in every step, lock recovery after a server crash
+and after a client crash included. Since 2026-11-26 hydra runs it, eating my own
+dogfood: `rpc.statd`, `sm-notify`, `rpc.idmapd` and `nfsidmap` are nfs-utils-rs's, on
+rpcbind-rs, serving the NFSv4 mounts autofs makes.
 
 Phase 1, groundwork and `sm-notify`:
 
