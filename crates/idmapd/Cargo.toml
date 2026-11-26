@@ -11,6 +11,10 @@ rust-version.workspace = true
 name = "nfsidmap"
 path = "src/nfsidmap.rs"
 
+[[bin]]
+name = "idmapd"
+path = "src/idmapd/main.rs"
+
 [dependencies]
 libc.workspace = true
 nfsidmap = { path = "../nfsidmap" }

@@ -1356,3 +1356,198 @@ impl Drop for Regex {
         unsafe { libc::regfree(&mut *self.re) };
     }
 }
+
+// --- rpc.idmapd: libevent's epoll backend, inotify, and the rest of idmapd.c's calls.
+
+unsafe extern "C" {
+    static mut opterr: c_int;
+    #[link_name = "optopt"]
+    static mut OPTOPT: c_int;
+    fn warn(fmt: *const c_char, ...);
+    fn errx(status: c_int, fmt: *const c_char, ...) -> !;
+    fn alphasort(a: *mut *const libc::dirent, b: *mut *const libc::dirent) -> c_int;
+}
+
+/// Set `optind` (idmapd sets it to 1 between its two passes, without resetting
+/// glibc's other state).
+pub fn set_optind(v: i32) {
+    // SAFETY: getopt's global, written between calls.
+    unsafe { optind = v };
+}
+
+/// Set `opterr`.
+pub fn set_opterr(v: i32) {
+    // SAFETY: getopt's global, written between calls.
+    unsafe { opterr = v };
+}
+
+/// `optopt`.
+pub fn optopt() -> i32 {
+    // SAFETY: getopt's global, read between calls.
+    unsafe { OPTOPT }
+}
+
+/// `warn("%s", msg)`: `progname: msg: strerror(errno)` on stderr.
+pub fn warn_msg(msg: &[u8]) {
+    let m = cstring(msg);
+    // SAFETY: a constant format with one string argument.
+    unsafe { warn(c"%s".as_ptr(), m.as_ptr()) };
+}
+
+/// `errx(status, "%s", msg)`.
+pub fn errx_msg(status: i32, msg: &[u8]) -> ! {
+    let m = cstring(msg);
+    // SAFETY: a constant format with one string argument; errx exits.
+    unsafe { errx(status, c"%s".as_ptr(), m.as_ptr()) }
+}
+
+/// `scandir(path, &list, NULL, alphasort)`: the entries' names, or `errno`.
+pub fn scandir_alphasort(path: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
+    let p = cstring(path);
+    let mut list: *mut *mut libc::dirent = std::ptr::null_mut();
+    // SAFETY: alphasort has scandir's comparison signature; the list is freed below.
+    let n = unsafe { scandir(p.as_ptr(), &mut list, None, Some(alphasort)) };
+    if n < 0 {
+        return Err(errno());
+    }
+    let mut out = Vec::with_capacity(n as usize);
+    for i in 0..n as usize {
+        // SAFETY: scandir returned n malloc'ed entries in a malloc'ed array.
+        unsafe {
+            let e = *list.add(i);
+            out.push(CStr::from_ptr((*e).d_name.as_ptr()).to_bytes().to_vec());
+            libc::free(e.cast());
+        }
+    }
+    // SAFETY: the array itself.
+    unsafe { libc::free(list.cast()) };
+    Ok(out)
+}
+
+/// `epoll_create1(flags)`.
+pub fn epoll_create1(flags: i32) -> Fd {
+    // SAFETY: no memory is involved.
+    unsafe { libc::epoll_create1(flags) }
+}
+
+/// `epoll_create(size)`.
+pub fn epoll_create(size: i32) -> Fd {
+    // SAFETY: no memory is involved.
+    unsafe { libc::epoll_create(size) }
+}
+
+/// `epoll_ctl(epfd, op, fd, {events, data.fd = fd})`.
+pub fn epoll_ctl(epfd: Fd, op: i32, fd: Fd, events: u32) -> i32 {
+    let mut ev = libc::epoll_event { events, u64: fd as u32 as u64 };
+    // SAFETY: ev is a valid epoll_event.
+    unsafe { libc::epoll_ctl(epfd, op, fd, &mut ev) }
+}
+
+/// `epoll_wait(epfd, events, max, timeout)`: each ready descriptor's events and
+/// `data.fd`, or `errno`.
+pub fn epoll_wait(epfd: Fd, max: usize, timeout: i32) -> Result<Vec<(u32, Fd)>, i32> {
+    let mut evs = vec![libc::epoll_event { events: 0, u64: 0 }; max];
+    // SAFETY: evs has room for max events.
+    let n = unsafe { libc::epoll_wait(epfd, evs.as_mut_ptr(), max as c_int, timeout) };
+    if n < 0 {
+        return Err(errno());
+    }
+    Ok(evs[..n as usize].iter().map(|e| (e.events, e.u64 as u32 as Fd)).collect())
+}
+
+/// `pipe2(fds, flags)`.
+pub fn pipe2(flags: i32) -> Option<(Fd, Fd)> {
+    let mut fds = [0 as c_int; 2];
+    // SAFETY: fds has room for two ints.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), flags) } < 0 {
+        return None;
+    }
+    Some((fds[0], fds[1]))
+}
+
+/// `fcntl(fd, F_SETFD, FD_CLOEXEC)` after `F_GETFD`, as libevent's
+/// `evutil_make_socket_closeonexec()` does.
+pub fn set_cloexec(fd: Fd) -> i32 {
+    // SAFETY: no memory is involved.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD, 0);
+        if flags < 0 {
+            return -1;
+        }
+        if flags & libc::FD_CLOEXEC == 0 { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } else { 0 }
+    }
+}
+
+/// `inotify_init1(flags)`.
+pub fn inotify_init1(flags: i32) -> Fd {
+    // SAFETY: no memory is involved.
+    unsafe { libc::inotify_init1(flags) }
+}
+
+/// `inotify_add_watch(fd, path, mask)`.
+pub fn inotify_add_watch(fd: Fd, path: &[u8], mask: u32) -> i32 {
+    let p = cstring(path);
+    // SAFETY: a valid C string.
+    unsafe { libc::inotify_add_watch(fd, p.as_ptr(), mask) }
+}
+
+/// `sigaction(sig, {handler, SA_RESTART, all signals blocked}, NULL)`, as libevent's
+/// `evsig_set_handler_()` installs its handler.
+pub fn sigaction_blocking_all(sig: i32, handler: extern "C" fn(c_int)) -> i32 {
+    // SAFETY: an all-zero sigaction is valid; the mask is filled and the handler is
+    // an extern "C" fn(c_int).
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handler as usize;
+        sa.sa_flags |= libc::SA_RESTART;
+        libc::sigfillset(&mut sa.sa_mask);
+        libc::sigaction(sig, &sa, std::ptr::null_mut())
+    }
+}
+
+/// `sscanf(s, "\\%03o", &val)`, as idmapd's `getfield()` decodes an escape: the
+/// conversion count and the value (`prev` when nothing was converted).
+pub fn scan_escape(s: &[u8], prev: u32) -> (i32, u32) {
+    let c = cstring(s);
+    let mut v: libc::c_uint = prev;
+    // SAFETY: one unsigned int conversion.
+    let n = unsafe { sscanf(c.as_ptr(), c"\\%03o".as_ptr(), &mut v as *mut libc::c_uint) };
+    (n, v)
+}
+
+/// `strtoul(s, NULL, 10)` and whether `errno` was `ERANGE` afterwards (it isn't
+/// cleared first, as in idmapd).
+pub fn strtoul_errno(s: &[u8]) -> (u64, i32) {
+    let c = cstring(s);
+    // SAFETY: a valid C string; no end pointer.
+    let v = unsafe { libc::strtoul(c.as_ptr(), std::ptr::null_mut(), 10) };
+    (v as u64, errno())
+}
+
+/// `getpwnam(name)->pw_uid` (glibc's own buffer, which grows as needed).
+pub fn getpwnam_uid(name: &[u8]) -> Option<u32> {
+    let n = cstring(name);
+    // SAFETY: a valid C string; the result is read at once.
+    unsafe {
+        let p = libc::getpwnam(n.as_ptr());
+        if p.is_null() { None } else { Some((*p).pw_uid) }
+    }
+}
+
+/// `getgrnam(name)->gr_gid`.
+pub fn getgrnam_gid(name: &[u8]) -> Option<u32> {
+    let n = cstring(name);
+    // SAFETY: a valid C string; the result is read at once.
+    unsafe {
+        let g = libc::getgrnam(n.as_ptr());
+        if g.is_null() { None } else { Some((*g).gr_gid) }
+    }
+}
+
+/// glibc's `__chk_fail()`, which a `_FORTIFY_SOURCE` build reaches when a string
+/// function would overflow its buffer: the message on stderr, then `abort()`.
+pub fn chk_fail() -> ! {
+    stderr(b"*** buffer overflow detected ***: terminated\n");
+    // SAFETY: ends the process.
+    unsafe { libc::abort() }
+}

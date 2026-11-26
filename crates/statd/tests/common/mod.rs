@@ -92,6 +92,10 @@ pub fn rust_nfsidmap() -> PathBuf {
     own_bin(option_env!("CARGO_BIN_EXE_nfsidmap"), "nfsidmap")
 }
 
+pub fn rust_idmapd() -> PathBuf {
+    own_bin(option_env!("CARGO_BIN_EXE_idmapd"), "idmapd")
+}
+
 pub fn rust_idmaptest() -> PathBuf {
     own_bin(option_env!("CARGO_BIN_EXE_idmaptest"), "idmaptest")
 }
@@ -137,6 +141,16 @@ pub fn keys_shim() -> PathBuf {
     BUILT
         .get_or_init(|| {
             build_tool("fakekeys.so", &["-shared", "-fPIC", "-O2"], "crates/idmapd/tests/shim/fakekeys.c", &["-ldl"])
+        })
+        .clone()
+}
+
+/// crates/idmapd/tests/shim/fakepipes.c, the LD_PRELOAD kernel channels.
+pub fn pipes_shim() -> PathBuf {
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            build_tool("fakepipes.so", &["-shared", "-fPIC", "-O2"], "crates/idmapd/tests/shim/fakepipes.c", &["-ldl"])
         })
         .clone()
 }
@@ -192,8 +206,8 @@ pub struct Case {
     pub before: Vec<String>,
     /// The program's descriptor limit (`ulimit -n`), if not the default.
     pub nofile: Option<u32>,
-    /// Collapse runs of the same line on stderr (a busy loop's log, whose length is
-    /// timing).
+    /// Collapse runs of the same line on stderr, and of the same syslog message (a busy
+    /// loop's log, whose length is timing).
     pub squeeze: bool,
     /// Files under `T` (relative path, contents), written before the run.
     pub files: Vec<(String, Vec<u8>)>,
@@ -535,7 +549,8 @@ done
 (cd "$R/etc" && find . -type d | while read d; do mkdir -p "/etc/$d"; done
  find . -type f | while read f; do rm -f "/etc/$f"; cp "$f" "/etc/$f"; done) || exit 95
 mount --bind "$R/nfs" /var/lib/nfs || exit 96
-: >"$R/out/nsm_local_state"; : >"$R/out/nlm_end_grace"; : >"$R/out/nlm_tcpport"; : >"$R/out/nlm_udpport"
+: >"$R/out/nsm_local_state"; : >"$R/out/nlm_end_grace"; : >"$R/out/nlm_tcpport"; : >"$R/out/nlm_udpport"; : >"$R/out/idmap_cache_timeout"
+[ -e /proc/sys/fs/nfs/idmap_cache_timeout ] && mount --bind "$R/out/idmap_cache_timeout" /proc/sys/fs/nfs/idmap_cache_timeout
 [ -e /proc/sys/fs/nfs/nsm_local_state ] && mount --bind "$R/out/nsm_local_state" /proc/sys/fs/nfs/nsm_local_state
 [ -e /proc/fs/lockd/nlm_end_grace ] && mount --bind "$R/out/nlm_end_grace" /proc/fs/lockd/nlm_end_grace
 [ -e /proc/sys/fs/nfs/nlm_tcpport ] && mount --bind "$R/out/nlm_tcpport" /proc/sys/fs/nfs/nlm_tcpport
@@ -564,7 +579,15 @@ RBPID=$!
 "#,
         );
     }
-    let launch = if statd {
+    let idmapd = case.prog == "rpc.idmapd";
+    let launch = if idmapd {
+        // In the background, for the probe to drive; its status once it's stopped.
+        r#"mkfifo "$R/out/finish"
+(env LD_PRELOAD="$R/bin/faketime.so" TEST_FAKETIME="$R/faketime" TEST_VIRTUAL_POLL={poll} {env} "$R/bin/{prog}" {args}) >"$R/out/stdout" 2>"$R/out/stderr" </dev/null &
+PROG=$!
+echo $PROG >"$R/out/launched.tmp" && mv "$R/out/launched.tmp" "$R/out/launched"
+read x <"$R/out/finish""#
+    } else if statd {
         r#"mkfifo "$R/out/finish"
 (env LD_PRELOAD="$R/bin/faketime.so" TEST_FAKETIME="$R/faketime" TEST_VIRTUAL_POLL={poll} {env} "$R/bin/{prog}" {args}) >"$R/out/stdout" 2>"$R/out/stderr" </dev/null &
 wait $!
@@ -589,7 +612,7 @@ if [ -n "$(pids)" ]; then
   echo "daemon still running" >>"$R/out/status"
   for p in $(pids); do kill -KILL $p; done
 fi
-: >"$R/out/stop"
+{wait_prog}: >"$R/out/stop"
 wait $PPID_
 (cd /var/lib/nfs && find . -mindepth 1 | sort | while read f; do
   echo "$(stat -c '%A %U %G %s' "$f") $f"
@@ -617,6 +640,7 @@ exit 0
             .replace("{prog}", &case.prog)
             .replace("{args}", &args.join(" ")),
         comm = case.prog.chars().take(15).collect::<String>(),
+        wait_prog = if idmapd { "wait $PROG\necho \"exit $?\" >>\"$R/out/status\"\n" } else { "" },
     ));
     if case.rpcbind {
         s = s.replace("\nexit 0\n", "\nkill $RBPID 2>/dev/null; wait $RBPID 2>/dev/null\nexit 0\n");
@@ -713,6 +737,12 @@ pub fn run(case: &Case, imp: &Impl) -> Outcome {
         probe.extend(case.probe.iter().map(at_t));
         probe.push(format!("finish {}/out/finish", root.display()));
     }
+    if case.prog == "rpc.idmapd" {
+        probe.push(format!("await-idmapd {}/out/launched", root.display()));
+        probe.extend(case.probe.iter().map(at_t));
+        probe.push("stop".into());
+        probe.push(format!("finish {}/out/finish", root.display()));
+    }
     probe.push(format!("serve {}/out/stop", root.display()));
     std::fs::write(t.join("probe.in"), probe.join("\n") + "\n").unwrap();
 
@@ -764,25 +794,37 @@ pub fn run(case: &Case, imp: &Impl) -> Outcome {
         status: read(&t, "out/status").trim().to_string(),
         stdout: fix(read(&t, "out/stdout")),
         stderr: if case.squeeze { squeeze(&fix(read(&t, "out/stderr"))) } else { fix(read(&t, "out/stderr")) },
-        syslog: syslog.into_iter().map(fix).collect(),
+        syslog: {
+            let mut v: Vec<String> = syslog.into_iter().map(fix).collect();
+            if case.squeeze {
+                v.dedup();
+            }
+            v
+        },
         peers,
         state: read(&t, "out/state"),
         run: read(&t, "out/run"),
         kernel: format!(
-            "nsm_local_state={:?} nlm_end_grace={:?} nlm_tcpport={:?} nlm_udpport={:?}",
+            "nsm_local_state={:?} nlm_end_grace={:?} nlm_tcpport={:?} nlm_udpport={:?} idmap_cache_timeout={:?} \
+             idtoname/flush={:?} nametoid/flush={:?}",
             read(&t, "out/nsm_local_state"),
             read(&t, "out/nlm_end_grace"),
             read(&t, "out/nlm_tcpport"),
-            read(&t, "out/nlm_udpport")
+            read(&t, "out/nlm_udpport"),
+            read(&t, "out/idmap_cache_timeout"),
+            read(&t, "procrpc/nfs4.idtoname/flush"),
+            read(&t, "procrpc/nfs4.nametoid/flush")
         ),
         keylog: fix(read(&t, "out/keylog")),
     }
 }
 
-/// Runs of the same line as one, marked ` (repeated)`.
+/// Runs of the same line as one, marked ` (repeated)`. A last line without its newline
+/// (the program was killed between the writes of one message) is left out.
 fn squeeze(s: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut last: Option<&str> = None;
+    let s = &s[..s.rfind('\n').map_or(0, |p| p + 1)];
     for l in s.split_inclusive('\n') {
         if last == Some(l) {
             if let Some(o) = out.last_mut()
@@ -841,6 +883,33 @@ pub fn check(case: Case) -> Outcome {
             c.env = env(&["LD_LIBRARY_PATH=@T@/bin/lib"]);
             c.setup = vec![format!("mount --bind {} /usr/lib64/libnfsidmap", q(plugins.to_str().unwrap()))];
             let mut r = imp("r", vec![b(&case.prog, rbin), keys]);
+            r.env = env(&[]);
+            (c, r)
+        }
+        "rpc.idmapd" => {
+            // As for nfsidmap: the C library from the reference tree, its plugins where
+            // it looks for them. The pipes shim for both.
+            let pipes = b("fakepipes.so", pipes_shim());
+            let env = |extra: &[&str]| {
+                let mut e = vec![
+                    "LD_PRELOAD=@T@/bin/faketime.so @T@/bin/fakepipes.so".to_string(),
+                    "TEST_REMAP=/proc/net/rpc=@T@/procrpc".to_string(),
+                ];
+                e.extend(extra.iter().map(|s| s.to_string()));
+                e
+            };
+            let plugins = reference_file("support/nfsidmap/.libs");
+            let mut c = imp(
+                "c",
+                vec![
+                    b("rpc.idmapd", reference_file("utils/idmapd/.libs/idmapd")),
+                    pipes.clone(),
+                    b("lib/libnfsidmap.so.1", reference_file("support/nfsidmap/.libs/libnfsidmap.so.1")),
+                ],
+            );
+            c.env = env(&["LD_LIBRARY_PATH=@T@/bin/lib"]);
+            c.setup = vec![format!("mount --bind {} /usr/lib64/libnfsidmap", q(plugins.to_str().unwrap()))];
+            let mut r = imp("r", vec![b("rpc.idmapd", rust_idmapd()), pipes]);
             r.env = env(&[]);
             (c, r)
         }

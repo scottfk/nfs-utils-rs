@@ -103,3 +103,36 @@ three names exactly.
 | low | A failed answer other than a full keyring (`EDQUOT`, `ENFILE`, `ENOMEM`, which clear `.id_resolver` and retry) exits 1 without a message. | `nfsidmap::id_lookup` | `instantiate_other_error` |
 | low | Errors are fatal wherever they come: `-l` stops at the first key it can't describe, and a failed name lookup reports a negative errno (`Unknown error -2`). | `nfsidmap::list_key`, `name_lookup` | `list_describe_fails`, `user_key_unknown_uid` |
 | low | A `/proc/keys` line without a newline makes libkeyutils' search dereference NULL, and with `-v`, so does `key_invalidate()`; the port dies of `SIGSEGV` there too. The kernel always ends its lines. | `nfsidmap::find_key_by_type_and_desc`, `key_invalidate` | - |
+
+## rpc.idmapd (utils/idmapd/idmapd.c)
+
+| Severity | Quirk | Where | Test |
+|---|---|---|---|
+| medium | The `SIGUSR1` rescan is libevent's signal event, which passes the signal number where `dirscancb()` expects the inotify descriptor: the rescan first reads descriptor 10 dry. In the usual layouts 10 is a client's directory (`EISDIR`) or the inotify descriptor itself, and nothing happens. When 10 is a channel or a client's pipe (one nfsd channel and a client in the foreground, say), the read blocks: every later request waits, and that pipe's requests are swallowed (logged as inotify events at `-vvv`). The first `SIGTERM` is restarted past (`SA_RESTART`); a second one exits. | `Idmapd::dirscancb` | `sigusr1_reads_fd_10`, `sigusr1_reads_fd_10_verbose`, `sigusr1_fd_10_harmless` |
+| medium | A `-c` file that doesn't exist (or can't be read) is skipped with nothing else read: not `idmapd.conf`, not `nfs.conf`. The cache expiry is then 0, not 600, and written to `/proc/sys/fs/nfs/idmap_cache_timeout`; nfsd's entries expire as they're made. | `main` | `c_missing_file` |
+| low | With `-S` (or `server-only`) no signal is handled: `SIGTERM` and `SIGINT` kill it without the "exiting" message, `SIGHUP` kills it instead of reopening nfsd's channels, and `SIGUSR1`/`SIGUSR2` are xlog's debug toggles. | `main` | `server_only`, `server_only_signals` |
+| low | With `-C` (or `client-only`) nfsd's channels aren't opened, but `SIGHUP` "reopens" them, and from then on nfsd is served. | `Idmapd::nfsdreopen` | `client_only_hup_opens_nfsd` |
+| low | Without `-c`, `Pipefs-Directory` comes from `nfs.conf` only (`idmapd.conf`'s is ignored); with `-c`, from that file only. | `main` | `default_files`, `c_file` |
+| low | nfsd's channels are opened name-to-id first, and id-to-name only if that worked. With just name-to-id present it is served but the caches aren't flushed, and with `-S` the program then exits for "neither" having been found. A flush that fails is fatal, after the first one may have been written. | `Idmapd::nfsdopen`, `main` | `nfsd_half_present`, `flush_missing` |
+| low | In client mode a pipefs directory that can't be watched (missing, or a name too long) is fatal. A `-p` or `Pipefs-Directory` of 4,092 bytes or more aborts in the fortified `strncat()` (`*** buffer overflow detected ***`), a longer one after being cut to 4,095. | `main` | `no_pipefs`, `p_too_long` |
+| low | In nfsd's upcalls an escape always moves on four bytes, even when `%03o` took fewer digits (`\7`): past the end of the field and into the next, whose bytes are then read twice. `%o` takes a sign (`\-01` is too big), and `\000` ends a field early. | `getfield` | `escapes` |
+| low | The upcall's last byte is taken for its newline, whatever it is. | `Idmapd::nfsdcb` | `no_newline` |
+| low | A type other than `user` is a group. An id that isn't a number is 0 (`abc` is root), `+5` is 5, and only ids over 2^32 - 1 are refused. | `Idmapd::nfsdcb` | `name_to_id`, `id_to_name`, `id_parsing` |
+| low | The check "for NULL termination" looks at the byte after the name's NUL: when that isn't 0 (an escaped `\000` in nfsd's upcall, or a client message with bytes there), nothing is looked up. nfsd gets a negative entry; the client gets its message back as it came, with `LOOKUPFAIL` turned into `SUCCESS`. | `Idmapd::imconv` | `escapes`, `client_odd_messages` |
+| low | An answer that doesn't fit nfsd's 257-byte buffer (escaped spaces take four bytes) loses the fields that don't fit, without a message; the newline goes over the last space written. | `addfield` | `reply_overflow` |
+| low | A `Nobody-User` or `Nobody-Group` of 128 bytes or more answers id-to-name failures as `nobody`, while name-to-id failures still get its id. Ids over 2^31 - 1 are logged as negative numbers. | `Idmapd::idtonameres` | `long_nobody`, `client_lookups` |
+| low | An end of file on a channel or a pipe is "no upcall": the descriptor stays readable and the loop spins, logging the last `errno` again for a client at `-v`. When it spins logging, `SIGTERM` can deadlock: `sig_die()` logs from the signal handler, and if that interrupts the loop's own `syslog()` call, the lock is already held. The port makes the same calls. | `Idmapd::nfsdcb`, `nfscb`, `sig_die` | `channel_eof_spins`, `client_reset` |
+| low | `ic_clid` holds 29 bytes: a client directory whose name is longer never matches its own entry, so every scan drops the client and opens it again. | `Idmapd::dirscancb` | `long_client_names` |
+| low | Every entry whose name starts with `clnt` is tried, `clnt` alone being a client with an empty id. One that can't be opened (a socket) ends the scan there, and the clients that went away aren't dropped. A regular file for the pipe is opened, and epoll refuses it (libevent says so on stderr): a client with no events. | `Idmapd::dirscancb` | `odd_entries`, `file_as_pipe` |
+| low | When the pipefs directory goes away, every scan fails and no client is dropped. `SIGUSR2` reopens the clients whose pipe is closed, which none ever is. | `Idmapd::dirscancb`, `clntscancb` | `pipefs_removed`, `sigusr2_and_sigint` |
+| low | `-:` "requires an argument" (`strchr()` finds `:` in the option string). | `main` | `colon_option` |
+
+libevent is reproduced as rpc.idmapd uses it ([`ev`](crates/idmapd/src/idmapd/ev.rs)):
+its epoll backend with the same descriptors in the same order, the same `epoll_ctl()`
+calls and warnings, the self-pipe and handler for signals, the order in which ready
+events run, and what happens when descriptors run out at the start. Not reproduced:
+libevent's environment variables (`EVENT_NOEPOLL` and the others, which choose another
+backend or turn on its debug output), and its `poll()` and `select()` backends, which
+it uses only when epoll isn't there. `event_base_loopexit()` from `sig_die()` sets a
+flag the loop checks, where libevent adds an event to its queue from the handler (and
+could corrupt it, if the signal came in the middle of the loop changing it).
